@@ -89,6 +89,36 @@ if not logger.handlers:
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+def format_stage_provider_requirements(
+    *,
+    stage: str,
+    llm_requirement: str,
+    embedding_requirement: str,
+    rerank_requirement: str = "no",
+    llm_model_func: Callable[..., object] | None = None,
+    embedding_func: Any | None = None,
+    rerank_model_func: Callable[..., object] | None = None,
+    note: str | None = None,
+) -> str:
+    """
+    Create a single-line log message describing whether a stage may call external providers.
+
+    Requirement fields are strings to allow: "required" | "optional" | "no".
+    """
+    # [WNC] Helper for annotating major stages in logs. This is intentionally simple:
+    # it indicates which capabilities a stage may use (LLM/embeddings/rerank), while
+    # leaving "remote vs local provider" interpretation to the user's config.
+    parts = [
+        f"[WNC][Provider] stage={stage}",
+        f"llm={llm_requirement}",
+        f"embedding={embedding_requirement}",
+        f"rerank={rerank_requirement}",
+    ]
+    if note:
+        parts.append(f"note={note}")
+    return " | ".join(parts)
+
+
 def _patch_ascii_colors_console_handler() -> None:
     """Prevent ascii_colors from printing flush errors during interpreter exit."""
 

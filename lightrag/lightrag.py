@@ -111,6 +111,7 @@ from lightrag.utils import (
     subtract_source_ids,
     make_relation_chunk_key,
     normalize_source_ids_limit_method,
+    format_stage_provider_requirements,
 )
 from lightrag.types import KnowledgeGraph
 from dotenv import load_dotenv
@@ -1175,6 +1176,18 @@ class LightRAG:
         if track_id is None:
             track_id = generate_track_id("insert")
 
+        # [WNC] Stage annotation: clarify whether Indexing may use LLM/embeddings.
+        logger.info(
+            format_stage_provider_requirements(
+                stage="Indexing",
+                llm_requirement="required",
+                embedding_requirement="required",
+                llm_model_func=self.llm_model_func,
+                embedding_func=self.embedding_func,
+                note="LLM/embedding calls may be satisfied by cache; internet depends on provider backend",
+            )
+        )
+
         await self.apipeline_enqueue_documents(input, ids, file_paths, track_id)
         await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only
@@ -1785,6 +1798,18 @@ class LightRAG:
                                 log_message = f"Extracting stage {current_file_number}/{total_files}: {file_path}"
                                 logger.info(log_message)
                                 pipeline_status["history_messages"].append(log_message)
+
+                                # [WNC] Stage annotation: entity/relation extraction is LLM-driven.
+                                log_message = format_stage_provider_requirements(
+                                    stage="Entity/Relation extraction",
+                                    llm_requirement="required",
+                                    embedding_requirement="no",
+                                    llm_model_func=self.llm_model_func,
+                                    note="LLM cache may avoid provider calls when enabled",
+                                )
+                                logger.info(log_message)
+                                pipeline_status["history_messages"].append(log_message)
+
                                 log_message = f"Processing d-id: {doc_id}"
                                 logger.info(log_message)
                                 pipeline_status["latest_message"] = log_message
@@ -1852,6 +1877,18 @@ class LightRAG:
 
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
+                            # [WNC] Stage annotation: chunk upsert computes embeddings for vector search.
+                            log_message = format_stage_provider_requirements(
+                                stage="Embedding (chunks)",
+                                llm_requirement="no",
+                                embedding_requirement="required",
+                                embedding_func=self.embedding_func,
+                                note="upserting chunk vectors into chunks_vdb",
+                            )
+                            logger.info(log_message)
+                            async with pipeline_status_lock:
+                                pipeline_status["history_messages"].append(log_message)
+
                             doc_status_task = asyncio.create_task(
                                 self.doc_status.upsert(
                                     {
@@ -2585,6 +2622,25 @@ class LightRAG:
             actual data is nested under the 'data' field, with 'status' and 'message'
             fields at the top level.
         """
+        # [WNC] Stage annotation: retrieval-only query can still require embeddings (and optionally
+        # an LLM if embedding_cache_config.use_llm_check is enabled).
+        embedding_requirement = "no" if param.mode == "bypass" else "required"
+        llm_requirement = (
+            "optional" if self.embedding_cache_config.get("use_llm_check") else "no"
+        )
+        logger.info(
+            format_stage_provider_requirements(
+                stage="Query (retrieval-only)",
+                llm_requirement=llm_requirement,
+                embedding_requirement=embedding_requirement,
+                rerank_requirement="optional" if param.enable_rerank else "no",
+                llm_model_func=self.llm_model_func,
+                embedding_func=self.embedding_func,
+                rerank_model_func=self.rerank_model_func,
+                note="retrieval/context building only; no answer generation",
+            )
+        )
+
         global_config = asdict(self)
 
         # Create a copy of param to avoid modifying the original
@@ -2702,6 +2758,28 @@ class LightRAG:
             dict[str, Any]: Complete response with structured data and LLM response.
         """
         logger.debug(f"[aquery_llm] Query param: {param}")
+
+        # [WNC] Stage annotation: query with LLM generation always uses LLM; most modes also
+        # use embeddings for retrieval (except bypass).
+        use_llm_func = param.model_func or self.llm_model_func
+        embedding_requirement = "no" if param.mode == "bypass" else "required"
+        rerank_requirement = (
+            "no"
+            if param.mode == "bypass"
+            else ("optional" if param.enable_rerank else "no")
+        )
+        logger.info(
+            format_stage_provider_requirements(
+                stage=f"Query (mode={param.mode})",
+                llm_requirement="required",
+                embedding_requirement=embedding_requirement,
+                rerank_requirement=rerank_requirement,
+                llm_model_func=use_llm_func,
+                embedding_func=self.embedding_func,
+                rerank_model_func=self.rerank_model_func,
+                note="answer generation uses LLM; retrieval may use embeddings",
+            )
+        )
 
         global_config = asdict(self)
 

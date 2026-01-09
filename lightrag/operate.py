@@ -39,6 +39,7 @@ from lightrag.utils import (
     apply_source_ids_limit,
     merge_source_ids,
     make_relation_chunk_key,
+    format_stage_provider_requirements,
 )
 from lightrag.base import (
     BaseGraphStorage,
@@ -2464,9 +2465,28 @@ async def merge_nodes_and_edges(
 
     log_message = f"Merging stage {current_file_number}/{total_files}: {file_path}"
     logger.info(log_message)
-    async with pipeline_status_lock:
-        pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+    if pipeline_status is not None and pipeline_status_lock is not None:
+        async with pipeline_status_lock:
+            pipeline_status["latest_message"] = log_message
+            pipeline_status["history_messages"].append(log_message)
+
+    # [WNC] Stage annotation: merge can trigger optional LLM summarization for entities/relations,
+    # and will upsert vectors when the corresponding VDBs are enabled.
+    embedding_requirement = (
+        "required" if (entity_vdb is not None or relationships_vdb is not None) else "no"
+    )
+    log_message = format_stage_provider_requirements(
+        stage="Merging",
+        llm_requirement="optional",
+        embedding_requirement=embedding_requirement,
+        llm_model_func=global_config.get("llm_model_func"),
+        embedding_func=global_config.get("embedding_func"),
+        note="may summarize entities/relations and upsert vectors",
+    )
+    logger.info(log_message)
+    if pipeline_status is not None and pipeline_status_lock is not None:
+        async with pipeline_status_lock:
+            pipeline_status["history_messages"].append(log_message)
 
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
