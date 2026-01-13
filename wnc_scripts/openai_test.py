@@ -161,17 +161,26 @@ def main() -> None:
             "Missing question. Provide `--question ...` or set `CONFIG.question` in the config file."
         )
 
-    if args.skip_index:
-        skip_index = True
-    elif args.do_index:
-        skip_index = False
-    else:
-        skip_index = bool(getattr(config, "skip_index", False))
+    # [WNC] Handle indexing mode
+    index_mode = getattr(config, "index_mode", "incremental")
+    if index_mode not in ["skip", "incremental", "force"]:
+        raise SystemExit(f"Invalid index_mode: {index_mode}. Must be 'skip', 'incremental', or 'force'")
 
-    setup_logger("lightrag", level=os.getenv("LOG_LEVEL", "INFO"))
+    skip_index = (index_mode == "skip")
+
+    # [WNC] Log level can be controlled via environment variable or config
+    setup_logger("lightrag", level=os.getenv("LOG_LEVEL", config.log_level))
     # [WNC] Use time_only=True to show only time (09:20:06,054) instead of full datetime
     enable_console_timestamps("lightrag", time_only=True)
     enable_wnc_prefix("lightrag", script_name="openai_test.py")
+
+    # [WNC] Set prompt logging environment variables from config (if not already set)
+    if "WNC_ENABLE_PROMPT_LOGGING" not in os.environ:
+        os.environ["WNC_ENABLE_PROMPT_LOGGING"] = str(getattr(config, "enable_prompt_logging", True)).lower()
+    if "WNC_ENABLE_PROMPT_FILE_DUMP" not in os.environ:
+        os.environ["WNC_ENABLE_PROMPT_FILE_DUMP"] = str(getattr(config, "enable_prompt_file_dump", False)).lower()
+    if "WNC_PROMPT_DUMP_DIR" not in os.environ:
+        os.environ["WNC_PROMPT_DUMP_DIR"] = str(getattr(config, "prompt_dump_dir", "./prompt_logs"))
 
     # For standard OpenAI endpoints this must be set (or pass `--api-key-env`).
     # For Azure mode, LightRAG's OpenAI binding can also read Azure env vars,
@@ -181,14 +190,24 @@ def main() -> None:
     if not api_key and not config.openai.use_azure:
         raise SystemExit(f"Missing {api_key_env} in environment.")
 
+    # [WNC] Handle force reindex - delete working_dir
+    if index_mode == "force":
+        import shutil
+        if Path(working_dir).exists():
+            logger.warning(f"[WNC] index_mode='force' - Deleting working_dir: {working_dir}")
+            shutil.rmtree(working_dir)
+            logger.info(f"[WNC] Deleted working_dir. Will perform full re-indexing.")
+        else:
+            logger.info(f"[WNC] index_mode='force' but working_dir doesn't exist yet: {working_dir}")
+
     logger.info(
-        "Run config: config=%s working_dir=%s kdb_dir=%s backend=%s mode=%s skip_index=%s",
+        "[WNC] Run config: config=%s working_dir=%s kdb_dir=%s backend=%s mode=%s index_mode=%s",
         args.config,
         working_dir,
         kdb_dir,
         config.ingest.backend,
         mode,
-        skip_index,
+        index_mode,
     )
     if config.ingest.backend == "raganything":
         ra = config.ingest.raganything
@@ -331,6 +350,9 @@ def main() -> None:
         llm_model_name=config.openai.chat_model,
         embedding_func=embedding_func,
         max_parallel_insert=int(getattr(config, "max_parallel_insert", 2)),
+        # [WNC] Cache controls
+        enable_llm_cache=getattr(config, "enable_llm_cache", True),
+        enable_llm_cache_for_entity_extract=getattr(config, "enable_llm_cache_for_entity_extract", True),
     )
 
     # LightRAG requires explicit storage lifecycle management.
@@ -547,7 +569,30 @@ def main() -> None:
         else:
             with phase("Query"):
                 logger.info("Question:\n%s", question.strip())
-                answer = rag.query(question, param=QueryParam(mode=mode))
+                # [WNC] Generate trace_id for prompt logging
+                trace_id = None
+                if getattr(config, "trace_id_prefix", None):
+                    from datetime import datetime
+                    parts = [config.trace_id_prefix]
+
+                    # Add timestamp if enabled
+                    if getattr(config, "trace_id_include_timestamp", True):
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        parts.append(timestamp)
+
+                    # Add counter if enabled
+                    if getattr(config, "trace_id_auto_increment", True):
+                        # Note: In a real app with multiple queries, you'd track counter across queries
+                        parts.append("001")
+
+                    trace_id = "_".join(parts)
+                    # Examples:
+                    #   trace_id_prefix="query", include_timestamp=True, auto_increment=True  -> query_20260113_113008_001
+                    #   trace_id_prefix="query", include_timestamp=False, auto_increment=True -> query_001
+                    #   trace_id_prefix="query", include_timestamp=True, auto_increment=False -> query_20260113_113008
+                    #   trace_id_prefix="query", include_timestamp=False, auto_increment=False -> query
+
+                answer = rag.query(question, param=QueryParam(mode=mode, trace_id=trace_id))
 
         logger.info("Question:\n%s", question.strip())
         logger.info("Answer:\n%s", answer)

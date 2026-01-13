@@ -168,6 +168,13 @@ class QueryParam:
     containing citation information for the retrieved content.
     """
 
+    # [WNC] Trace ID for prompt logging and debugging
+    trace_id: str | None = None
+    """Optional trace ID for debugging and logging.
+    When provided, enables detailed prompt and context logging for this query.
+    Useful for debugging LLM responses and understanding what was sent to the model.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):

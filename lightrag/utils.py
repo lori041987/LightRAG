@@ -42,6 +42,8 @@ from lightrag.constants import (
     VALID_SOURCE_IDS_LIMIT_METHODS,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
 )
+# [WNC] Import prompt logging utilities
+from lightrag.wnc_prompt_logger import log_llm_prompt
 
 # Precompile regex pattern for JSON sanitization (module-level, compiled once)
 _SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
@@ -1973,6 +1975,8 @@ async def use_llm_func_with_cache(
     cache_type: str = "extract",
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
+    trace_id: str | None = None,  # [WNC] Added for prompt logging
+    stage: str | None = None,  # [WNC] Added for prompt logging
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -1991,6 +1995,8 @@ async def use_llm_func_with_cache(
         chunk_id: Chunk identifier to store in cache
         text_chunks_storage: Text chunks storage to update llm_cache_list
         cache_keys_collector: Optional list to collect cache keys for batch processing
+        trace_id: [WNC] Optional trace ID for prompt logging
+        stage: [WNC] Optional stage name for prompt logging
 
     Returns:
         tuple[str, int]: (LLM response text, timestamp)
@@ -2042,12 +2048,38 @@ async def use_llm_func_with_cache(
             logger.debug(f"Found cache for {arg_hash}")
             statistic_data["llm_cache"] += 1
 
+            # [WNC] Log cache hit
+            log_llm_prompt(
+                stage=stage or "unknown",
+                cache_type=cache_type,
+                system_prompt=safe_system_prompt,
+                user_prompt=safe_user_prompt,
+                history_messages=safe_history_messages,
+                trace_id=trace_id,
+                chunk_id=chunk_id,
+                cache_key=cache_key,
+                is_cache_hit=True,
+            )
+
             # Add cache key to collector if provided
             if cache_keys_collector is not None:
                 cache_keys_collector.append(cache_key)
 
             return content, timestamp
         statistic_data["llm_call"] += 1
+
+        # [WNC] Log actual LLM call (cache miss)
+        log_llm_prompt(
+            stage=stage or "unknown",
+            cache_type=cache_type,
+            system_prompt=safe_system_prompt,
+            user_prompt=safe_user_prompt,
+            history_messages=safe_history_messages,
+            trace_id=trace_id,
+            chunk_id=chunk_id,
+            cache_key=cache_key,
+            is_cache_hit=False,
+        )
 
         # Call LLM with sanitized input
         kwargs = {}
@@ -2089,6 +2121,19 @@ async def use_llm_func_with_cache(
         kwargs["history_messages"] = safe_history_messages
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+
+    # [WNC] Log LLM call when cache is disabled
+    log_llm_prompt(
+        stage=stage or "unknown",
+        cache_type=cache_type,
+        system_prompt=safe_system_prompt,
+        user_prompt=safe_user_prompt,
+        history_messages=safe_history_messages,
+        trace_id=trace_id,
+        chunk_id=chunk_id,
+        cache_key=None,
+        is_cache_hit=False,
+    )
 
     try:
         res = await use_llm_func(

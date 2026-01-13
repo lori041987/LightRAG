@@ -27,6 +27,8 @@ from lightrag.utils import (
     safe_unicode_decode,
     logger,
 )
+# [WNC] Import prompt logging utilities
+from lightrag.wnc_prompt_logger import log_llm_prompt
 
 from lightrag.types import GPTKeywordExtractionFormat
 from lightrag.api import __api_version__
@@ -277,6 +279,9 @@ async def openai_complete_if_cache(
 
     # Remove special kwargs that shouldn't be passed to OpenAI
     kwargs.pop("hashing_kv", None)
+    # [WNC] Extract trace_id and stage for prompt logging
+    trace_id = kwargs.pop("trace_id", None)
+    stage = kwargs.pop("stage", None)
 
     # Extract client configuration options
     client_configs = kwargs.pop("openai_client_configs", {})
@@ -313,6 +318,20 @@ async def openai_complete_if_cache(
     logger.debug("===== Sending Query to LLM =====")
 
     messages = kwargs.pop("messages", messages)
+
+    # [WNC] Log prompt details for debugging
+    log_llm_prompt(
+        stage=stage or "query",
+        cache_type="direct_call",  # This is a direct LLM call (not via cache)
+        system_prompt=system_prompt,
+        user_prompt=prompt,
+        history_messages=history_messages,
+        trace_id=trace_id,
+        is_cache_hit=False,
+        model=model,
+        keyword_extraction=keyword_extraction,
+        enable_cot=enable_cot,
+    )
 
     # Add explicit parameters back to kwargs so they're passed to OpenAI API
     if stream is not None:

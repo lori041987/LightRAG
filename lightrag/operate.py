@@ -359,6 +359,8 @@ async def _summarize_descriptions(
         use_llm_func,
         llm_response_cache=llm_response_cache,
         cache_type="summary",
+        trace_id=None,  # [WNC] TODO: propagate trace_id from indexing
+        stage=f"{description_type.lower()}_summarization",  # [WNC] Added for prompt logging
     )
 
     # Check summary token length against embedding limit
@@ -2872,6 +2874,8 @@ async def extract_entities(
             cache_type="extract",
             chunk_id=chunk_key,
             cache_keys_collector=cache_keys_collector,
+            trace_id=None,  # [WNC] TODO: propagate trace_id from indexing
+            stage="entity_extraction",  # [WNC] Added for prompt logging
         )
 
         history = pack_user_ass_to_openai_messages(
@@ -2899,6 +2903,8 @@ async def extract_entities(
                 cache_type="extract",
                 chunk_id=chunk_key,
                 cache_keys_collector=cache_keys_collector,
+                trace_id=None,  # [WNC] TODO: propagate trace_id from indexing
+                stage="entity_extraction_gleaning",  # [WNC] Added for prompt logging
             )
 
             # Process gleaning result separately with file path
@@ -3123,6 +3129,20 @@ async def kg_query(
         logger.info("[kg_query] No query context could be built; returning no-result.")
         return None
 
+    # [WNC] Log query context for debugging
+    from lightrag.wnc_prompt_logger import log_query_context
+    log_query_context(
+        trace_id=query_param.trace_id,
+        context_type="kg_query",
+        entities=context_result.raw_data.get("entities") if context_result.raw_data else None,
+        relations=context_result.raw_data.get("relations") if context_result.raw_data else None,
+        chunks=context_result.raw_data.get("chunks") if context_result.raw_data else None,
+        mode=query_param.mode,
+        hl_keywords=hl_keywords_str,
+        ll_keywords=ll_keywords_str,
+        context_length=len(context_result.context) if context_result.context else 0,
+    )
+
     # Return different content based on query parameters
     if query_param.only_need_context and not query_param.only_need_prompt:
         return QueryResult(
@@ -3182,6 +3202,18 @@ async def kg_query(
         logger.info(
             " == LLM cache == Query cache hit, using cached response as query result"
         )
+        # [WNC] Log cached query prompt for debugging
+        from lightrag.wnc_prompt_logger import log_llm_prompt
+        log_llm_prompt(
+            stage="kg_query",
+            cache_type="query",
+            system_prompt=sys_prompt,
+            user_prompt=user_query,
+            history_messages=query_param.conversation_history,
+            trace_id=query_param.trace_id,
+            is_cache_hit=True,
+            cache_key=f"query:{args_hash}",
+        )
         response = cached_response
     else:
         response = await use_model_func(
@@ -3190,6 +3222,8 @@ async def kg_query(
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            trace_id=query_param.trace_id,  # [WNC] Propagate trace_id for prompt logging
+            stage="kg_query",  # [WNC] Added for prompt logging
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
@@ -3333,7 +3367,12 @@ async def extract_keywords_only(
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
-    result = await use_model_func(kw_prompt, keyword_extraction=True)
+    result = await use_model_func(
+        kw_prompt,
+        keyword_extraction=True,
+        trace_id=param.trace_id,  # [WNC] Propagate trace_id for prompt logging
+        stage="keyword_extraction",  # [WNC] Added for prompt logging
+    )
 
     # 5. Parse out JSON from the LLM response
     result = remove_think_tags(result)
@@ -4929,6 +4968,18 @@ async def naive_query(
         reference_list_str=reference_list_str,
     )
 
+    # [WNC] Log query context for debugging
+    from lightrag.wnc_prompt_logger import log_query_context
+    log_query_context(
+        trace_id=query_param.trace_id,
+        context_type="naive_query",
+        entities=None,
+        relations=None,
+        chunks=processed_chunks_with_ref_ids,
+        mode=query_param.mode,
+        context_length=len(context_content),
+    )
+
     if query_param.only_need_context and not query_param.only_need_prompt:
         return QueryResult(content=context_content, raw_data=raw_data)
 
@@ -4965,6 +5016,18 @@ async def naive_query(
         logger.info(
             " == LLM cache == Query cache hit, using cached response as query result"
         )
+        # [WNC] Log cached query prompt for debugging
+        from lightrag.wnc_prompt_logger import log_llm_prompt
+        log_llm_prompt(
+            stage="naive_query",
+            cache_type="query",
+            system_prompt=sys_prompt,
+            user_prompt=user_query,
+            history_messages=query_param.conversation_history,
+            trace_id=query_param.trace_id,
+            is_cache_hit=True,
+            cache_key=f"query:{args_hash}",
+        )
         response = cached_response
     else:
         response = await use_model_func(
@@ -4973,6 +5036,8 @@ async def naive_query(
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            trace_id=query_param.trace_id,  # [WNC] Propagate trace_id for prompt logging
+            stage="naive_query",  # [WNC] Added for prompt logging
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
