@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 from contextlib import contextmanager
@@ -51,6 +52,17 @@ from lightrag.utils import (
     logger,
     setup_logger,
     wrap_embedding_func_with_attrs,
+)
+
+# [WNC] Import shared utilities from utils_test module in the same directory
+sys.path.insert(0, str(Path(__file__).parent))
+from utils_test import (
+    enable_console_timestamps,
+    enable_wnc_prefix,
+    phase,
+    load_mixed_docs,
+    load_docs_with_textract,
+    write_index_input_manifest,
 )
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("openai_test_config.py")
@@ -78,336 +90,6 @@ def _load_openai_test_config(config_path: Path):
         raise SystemExit(f"Config file must define `CONFIG`: {config_path}")
     return config
 
-
-def _enable_console_timestamps(logger_name: str = "lightrag") -> None:
-    """
-    LightRAG's default console logging format omits timestamps.
-    For long-running ingestion jobs, timestamps make phase boundaries much easier to read.
-    """
-    logger_instance = logging.getLogger(logger_name)
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    for handler in logger_instance.handlers:
-        if isinstance(handler, logging.StreamHandler):
-            handler.setFormatter(formatter)
-
-
-class _WNCModulePrefixFilter(logging.Filter):
-    """Prefix log records originating from this script to make them easy to spot."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            pathname = getattr(record, "pathname", "") or ""
-            if pathname.endswith(str(Path(__file__).name)):
-                msg = str(getattr(record, "msg", ""))
-                if not msg.startswith("[WNC]"):
-                    record.msg = f"[WNC] {msg}"
-        except Exception:
-            # Never block logging due to filter errors.
-            pass
-        return True
-
-
-def _enable_wnc_prefix(logger_name: str = "lightrag") -> None:
-    """Add a handler filter that prefixes logs from this script with [WNC]."""
-    logger_instance = logging.getLogger(logger_name)
-    prefix_filter = _WNCModulePrefixFilter()
-    for handler in logger_instance.handlers:
-        handler.addFilter(prefix_filter)
-
-
-@contextmanager
-def _phase(name: str):
-    start = perf_counter()
-    logger.info("==> %s", name)
-    try:
-        yield
-    finally:
-        elapsed = perf_counter() - start
-        logger.info("<== %s (%.2fs)", name, elapsed)
-
-
-def _json_value_to_text(value: object) -> str:
-    """Convert JSON values to readable text for embedding."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-def _sample_json_to_doc_text(sample: dict, include_ground_truth: bool) -> str:
-    """
-    Convert ONE JSON sample into a compact, embedding-friendly document.
-
-    We prioritize "signal" fields:
-    - metadata: id/tags/task_types
-    - payload: input_datas[*].content_raw (your XML snippets)
-    - optionally: ground_truths (labels/answers) if you explicitly enable it
-
-    Tip: Usually keep `include_ground_truth=False` to avoid "training on the answer".
-    """
-    lines: list[str] = []
-
-    for key in ("id", "tags", "task_types"):
-        if key in sample:
-            lines.append(f"{key}: {_json_value_to_text(sample.get(key))}")
-
-    input_datas = sample.get("input_datas") or []
-    if isinstance(input_datas, list) and input_datas:
-        lines.append("input_datas:")
-        for idx, item in enumerate(input_datas, start=1):
-            if not isinstance(item, dict):
-                continue
-            filename = _json_value_to_text(item.get("filename"))
-            timestamp = _json_value_to_text(item.get("timestamp"))
-            content_raw = _json_value_to_text(item.get("content_raw"))
-
-            header = f"- item_{idx}"
-            if filename:
-                header += f" filename={filename}"
-            if timestamp:
-                header += f" timestamp={timestamp}"
-            lines.append(header)
-            if content_raw:
-                lines.append(content_raw)
-
-    references = sample.get("references") or []
-    if references:
-        lines.append(f"references: {_json_value_to_text(references)}")
-
-    if include_ground_truth and "ground_truths" in sample:
-        lines.append(f"ground_truths: {_json_value_to_text(sample.get('ground_truths'))}")
-
-    return "\n".join([line for line in lines if line.strip()])
-
-
-def _load_json_docs(
-    kdb_dir: Path, include_ground_truth: bool
-) -> tuple[list[str], list[str]]:
-    """Load and format all `*.json` files under `kdb_dir`."""
-    docs: list[str] = []
-    file_paths: list[str] = []
-
-    for path in sorted(kdb_dir.rglob("*.json")):
-        try:
-            sample = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.warning("Skipping %s: failed to parse JSON: %s", path, e)
-            continue
-
-        if not isinstance(sample, dict):
-            logger.warning("Skipping %s: top-level JSON is not an object", path)
-            continue
-
-        doc_text = _sample_json_to_doc_text(sample, include_ground_truth)
-        if not doc_text.strip():
-            logger.warning("Skipping %s: empty doc text after formatting", path)
-            continue
-
-        docs.append(f"source_file: {path}\n{doc_text}")
-        file_paths.append(str(path))
-
-    return docs, file_paths
-
-
-def _extract_pdf_text_pypdf(path: Path) -> str:
-    """
-    Extract text from a PDF using pypdf (best-effort).
-
-    This is intentionally lightweight and offline. If you need higher quality PDF
-    extraction (tables/layout), consider using the LightRAG API server's upload
-    pipeline or a dedicated extractor.
-    """
-    try:
-        from pypdf import PdfReader  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "PDF support requires `pypdf`. Install it in your venv (e.g. `pip install pypdf`)."
-        ) from e
-
-    reader = PdfReader(str(path))
-    parts: list[str] = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        if text.strip():
-            parts.append(text)
-    return "\n".join(parts).strip()
-
-
-def _extract_with_textract(path: Path) -> str:
-    """Extract text with `textract` (matches README insert multi-file snippet)."""
-    """
-    Note: `textract` is an optional dependency; install it yourself if you choose
-    the textract ingest backend.
-    """
-    try:
-        import textract  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Ingest backend 'textract' requires `textract`. Install it in your venv (e.g. `pip install textract`)."
-        ) from e
-
-    data = textract.process(str(path))
-    return data.decode("utf-8", errors="ignore").strip()
-
-
-def _extract_pdf_text(path: Path, extractor: str) -> str:
-    """Extract text from PDF using chosen extractor: auto|textract|pypdf."""
-    if extractor == "textract":
-        return _extract_with_textract(path)
-    if extractor == "pypdf":
-        return _extract_pdf_text_pypdf(path)
-
-    # auto: prefer textract if installed, else pypdf
-    try:
-        return _extract_with_textract(path)
-    except ModuleNotFoundError:
-        return _extract_pdf_text_pypdf(path)
-
-
-def _load_mixed_docs(
-    kdb_dir: Path,
-    include_ground_truth: bool,
-    allow_pdf: bool,
-    pdf_extractor: str,
-) -> tuple[list[str], list[str]]:
-    """
-    Load documents from a directory tree.
-
-    Supported formats:
-    - `.json`: your structured samples (converted into a text document)
-    - `.txt` / `.md`: raw text files
-    - `.pdf`: extracted to text (requires `pypdf`) when `allow_pdf=True`
-    """
-    docs: list[str] = []
-    file_paths: list[str] = []
-
-    for path in sorted(kdb_dir.rglob("*")):
-        if not path.is_file():
-            continue
-
-        suffix = path.suffix.lower()
-        try:
-            if suffix == ".json":
-                sample = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(sample, dict):
-                    logger.warning(
-                        "Skipping %s: top-level JSON is not an object", path
-                    )
-                    continue
-                doc_text = _sample_json_to_doc_text(sample, include_ground_truth)
-                if not doc_text.strip():
-                    logger.warning(
-                        "Skipping %s: empty doc text after formatting", path
-                    )
-                    continue
-                docs.append(f"source_file: {path}\n{doc_text}")
-                file_paths.append(str(path))
-                continue
-
-            if suffix in {".txt", ".md"}:
-                text = path.read_text(encoding="utf-8", errors="ignore").strip()
-                if not text:
-                    logger.warning("Skipping %s: empty text file", path)
-                    continue
-                docs.append(f"source_file: {path}\n{text}")
-                file_paths.append(str(path))
-                continue
-
-            if suffix == ".pdf" and allow_pdf:
-                try:
-                    text = _extract_pdf_text(path, extractor=pdf_extractor)
-                except Exception as e:
-                    logger.warning("Skipping %s: failed PDF extraction: %s", path, e)
-                    continue
-                if not text:
-                    logger.warning("Skipping %s: empty extracted PDF text", path)
-                    continue
-                docs.append(f"source_file: {path}\n{text}")
-                file_paths.append(str(path))
-                continue
-        except Exception as e:
-            logger.warning("Skipping %s: failed to read/format: %s", path, e)
-            continue
-
-    return docs, file_paths
-
-
-def _load_docs_with_textract(
-    kdb_dir: Path, include_ground_truth: bool
-) -> tuple[list[str], list[str]]:
-    """
-    Ingest backend: textract
-
-    - `.json`: formatted into text (same as simple mode)
-    - other files: extracted to text by `textract` (PDF/DOCX/PPTX/CSV/etc.)
-    """
-    docs: list[str] = []
-    file_paths: list[str] = []
-
-    for path in sorted(kdb_dir.rglob("*")):
-        if not path.is_file():
-            continue
-
-        suffix = path.suffix.lower()
-        try:
-            if suffix == ".json":
-                sample = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(sample, dict):
-                    logger.warning(
-                        "Skipping %s: top-level JSON is not an object", path
-                    )
-                    continue
-                doc_text = _sample_json_to_doc_text(sample, include_ground_truth)
-                if not doc_text.strip():
-                    logger.warning(
-                        "Skipping %s: empty doc text after formatting", path
-                    )
-                    continue
-                docs.append(f"source_file: {path}\n{doc_text}")
-                file_paths.append(str(path))
-                continue
-
-            text = _extract_with_textract(path)
-            if not text:
-                logger.warning("Skipping %s: empty textract output", path)
-                continue
-            docs.append(f"source_file: {path}\n{text}")
-            file_paths.append(str(path))
-        except Exception as e:
-            logger.warning("Skipping %s: failed to read/format: %s", path, e)
-
-    return docs, file_paths
-
-
-def _write_index_input_manifest(
-    docs: list[str],
-    file_paths: list[str],
-    out_path: Path,
-    preview_chars: int,
-) -> None:
-    """
-    Save exactly what will be fed into `rag.insert(docs, file_paths=...)`.
-
-    This helps you verify the text formatting (especially for JSON-to-text conversion)
-    and confirm which source files were indexed.
-    """
-    if len(docs) != len(file_paths):
-        raise ValueError(
-            f"docs/file_paths length mismatch: {len(docs)} vs {len(file_paths)}"
-        )
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        f.write(f"count: {len(docs)}\n")
-        f.write(f"preview_chars: {preview_chars}\n")
-        f.write("\n")
-        for idx, (doc, path) in enumerate(zip(docs, file_paths), start=1):
-            preview = doc[:preview_chars].replace("\n", "\\n")
-            f.write(f"[{idx}] file_path: {path}\n")
-            f.write(f"[{idx}] doc_chars: {len(doc)}\n")
-            f.write(f"[{idx}] doc_preview: {preview}\n")
-            f.write("\n")
 
 
 def main() -> None:
@@ -487,8 +169,9 @@ def main() -> None:
         skip_index = bool(getattr(config, "skip_index", False))
 
     setup_logger("lightrag", level=os.getenv("LOG_LEVEL", "INFO"))
-    _enable_console_timestamps("lightrag")
-    _enable_wnc_prefix("lightrag")
+    # [WNC] Use time_only=True to show only time (09:20:06,054) instead of full datetime
+    enable_console_timestamps("lightrag", time_only=True)
+    enable_wnc_prefix("lightrag", script_name="openai_test.py")
 
     # For standard OpenAI endpoints this must be set (or pass `--api-key-env`).
     # For Azure mode, LightRAG's OpenAI binding can also read Azure env vars,
@@ -527,13 +210,13 @@ def main() -> None:
     docs: list[str] = []
     file_paths: list[str] = []
     if not skip_index:
-        with _phase("Prepare index inputs"):
+        with phase("Prepare index inputs"):
             if not kdb_dir.exists():
                 raise SystemExit(f"kdb dir not found: {kdb_dir}")
 
             ingest_backend = config.ingest.backend
             if ingest_backend == "simple":
-                docs, file_paths = _load_mixed_docs(
+                docs, file_paths = load_mixed_docs(
                     kdb_dir=kdb_dir,
                     include_ground_truth=config.ingest.include_ground_truth,
                     allow_pdf=config.ingest.allow_pdf,
@@ -546,7 +229,7 @@ def main() -> None:
                     )
                 logger.info("Prepared %s documents for indexing.", len(docs))
             elif ingest_backend == "textract":
-                docs, file_paths = _load_docs_with_textract(
+                docs, file_paths = load_docs_with_textract(
                     kdb_dir=kdb_dir,
                     include_ground_truth=config.ingest.include_ground_truth,
                 )
@@ -568,7 +251,7 @@ def main() -> None:
                 if args.dump_index_input_path
                 else Path(working_dir) / "index_input_manifest.txt"
             )
-            _write_index_input_manifest(
+            write_index_input_manifest(
                 docs=docs,
                 file_paths=file_paths,
                 out_path=out_path,
@@ -653,7 +336,7 @@ def main() -> None:
     # LightRAG requires explicit storage lifecycle management.
     # We initialize storages before indexing/querying and finalize at the end.
     loop = always_get_an_event_loop()
-    with _phase("Initialize storages"):
+    with phase("Initialize storages"):
         loop.run_until_complete(rag.initialize_storages())
     try:
         def _make_raganything(vision_model_func):
@@ -696,7 +379,7 @@ def main() -> None:
                 return RAGAnything(lightrag=rag, vision_model_func=vision_model_func)
 
         if not skip_index:
-            with _phase("Index documents"):
+            with phase("Index documents"):
                 # This enqueues documents and runs the internal pipeline:
                 # chunking -> embeddings -> entity/relation extraction -> graph construction.
                 ingest_backend = config.ingest.backend
@@ -792,7 +475,7 @@ def main() -> None:
                         )
 
                     for p in ingest_paths:
-                        with _phase(f"RAG-Anything process file: {p}"):
+                        with phase(f"RAG-Anything process file: {p}"):
                             loop.run_until_complete(
                                 rag_multi.process_document_complete(
                                     file_path=str(p),
@@ -856,20 +539,20 @@ def main() -> None:
                 )
 
             rag_multi = _make_raganything(vision_model_func)
-            with _phase("Query (multimodal)"):
+            with phase("Query (multimodal)"):
                 logger.info("Question:\n%s", question.strip())
                 answer = loop.run_until_complete(
                     rag_multi.query_with_multimodal(question, mode=mode)
                 )
         else:
-            with _phase("Query"):
+            with phase("Query"):
                 logger.info("Question:\n%s", question.strip())
                 answer = rag.query(question, param=QueryParam(mode=mode))
 
         logger.info("Question:\n%s", question.strip())
         logger.info("Answer:\n%s", answer)
     finally:
-        with _phase("Finalize storages"):
+        with phase("Finalize storages"):
             loop.run_until_complete(rag.finalize_storages())
 
 
