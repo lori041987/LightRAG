@@ -56,10 +56,10 @@ class OpenAISettings:
 class OpenAITestConfig:
     #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb"
     #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/3gpp"
-    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_251229_1"
+    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260120_1"
 
-    working_dir: str = "/srv/ai/LightRAG/rag_storage/openai_3gpp"
-    working_dir: str = "/srv/ai/LightRAG/rag_storage/openai_test_json_251229_1"
+    #working_dir: str = "/srv/ai/LightRAG/rag_storage/openai_3gpp"
+    working_dir: str = "/srv/ai/LightRAG/rag_storage/openai_test_json_260120_1"
 
     mode: Literal["naive", "local", "global", "hybrid", "mix", "bypass"] = "hybrid"
     skip_index: bool = False
@@ -67,6 +67,26 @@ class OpenAITestConfig:
     # Number of documents processed concurrently during `rag.insert(...)`.
     # Set to 1 for easier-to-read logs (no interleaving).
     max_parallel_insert: int = 1
+
+    # Re-indexing strategy
+    # - "skip": Skip indexing entirely (same as skip_index=True)
+    # - "incremental": Only index new files not already in storage (default)
+    # - "force": Force re-index all files, clearing existing storage first
+    reindex_strategy: Literal["skip", "incremental", "force"] = "force"
+
+    # Logging configuration
+    # LightRAG log level: DEBUG, INFO, WARNING, ERROR
+    lightrag_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "DEBUG"
+    # WNC custom log level: trace, debug, info, warning, error
+    wnc_log_level: Literal["trace", "debug", "info", "warning", "error"] = "trace"
+    # Enable verbose debug mode (adds extra detailed logging)
+    verbose_debug: bool = True
+
+    # Cache configuration
+    # Enable LLM response caching to avoid redundant API calls
+    enable_llm_cache: bool = False
+    # Enable caching specifically for entity extraction steps
+    enable_llm_cache_for_entity_extract: bool = False
 
     ingest: IngestSettings = IngestSettings()
     openai: OpenAISettings = OpenAISettings()

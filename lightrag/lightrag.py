@@ -26,6 +26,7 @@ from typing import (
 )
 from lightrag.prompt import PROMPTS
 from lightrag.exceptions import PipelineCancelledException
+from lightrag.wnc import wnc_log
 from lightrag.constants import (
     DEFAULT_MAX_GLEANING,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
@@ -445,6 +446,21 @@ class LightRAG:
     def __post_init__(self):
         from lightrag.kg.shared_storage import (
             initialize_share_data,
+        )
+
+        # [WNC] Log function entry
+        wnc_log(
+            function_name="LightRAG.__post_init__",
+            purpose="Validate config, wrap embedding func with concurrency limits, and instantiate storages",
+            inputs={
+                "working_dir": self.working_dir,
+                "kv_storage": self.kv_storage,
+                "vector_storage": self.vector_storage,
+                "graph_storage": self.graph_storage,
+                "llm_model_name": getattr(self, "llm_model_name", None),
+            },
+            note="Creates working_dir if missing; initializes JsonKVStorage, NanoVectorDBStorage, NetworkXStorage, JsonDocStatusStorage",
+            level="info",
         )
 
         # Handle deprecated parameters
@@ -1136,6 +1152,20 @@ class LightRAG:
         Returns:
             str: tracking ID for monitoring processing status
         """
+        # [WNC] Log function entry
+        wnc_log(
+            function_name="LightRAG.insert",
+            purpose="Sync wrapper that runs ainsert in an event loop",
+            inputs={
+                "input": input if isinstance(input, str) else f"list[{len(input)} docs]",
+                "ids": ids,
+                "file_paths": file_paths,
+                "track_id": track_id,
+            },
+            note="Calls ainsert via always_get_an_event_loop().run_until_complete()",
+            level="info",
+        )
+
         loop = always_get_an_event_loop()
         return loop.run_until_complete(
             self.ainsert(
@@ -1175,6 +1205,21 @@ class LightRAG:
         # Generate track_id if not provided
         if track_id is None:
             track_id = generate_track_id("insert")
+
+        # [WNC] Log function entry
+        wnc_log(
+            function_name="LightRAG.ainsert",
+            purpose="Generate track_id (if missing), enqueue docs, then process queued docs",
+            inputs={
+                "input": input if isinstance(input, str) else f"list[{len(input)} docs]",
+                "ids": ids if isinstance(ids, str) else (f"list[{len(ids)} ids]" if ids else None),
+                "file_paths": file_paths if isinstance(file_paths, str) else (f"list[{len(file_paths)} paths]" if file_paths else None),
+                "track_id": track_id,
+            },
+            outputs=f"track_id={track_id}",
+            note="Kicks off status writes + vector db writes + graph writes downstream",
+            level="info",
+        )
 
         # [WNC] Stage annotation: clarify whether Indexing may use LLM/embeddings.
         logger.info(

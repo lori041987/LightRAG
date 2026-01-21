@@ -161,14 +161,37 @@ def main() -> None:
             "Missing question. Provide `--question ...` or set `CONFIG.question` in the config file."
         )
 
+    # Determine indexing behavior from reindex_strategy or legacy skip_index
+    reindex_strategy = getattr(config, "reindex_strategy", "incremental")
     if args.skip_index:
         skip_index = True
+        reindex_strategy = "skip"
     elif args.do_index:
         skip_index = False
+        # Keep reindex_strategy from config
     else:
         skip_index = bool(getattr(config, "skip_index", False))
+        if skip_index:
+            reindex_strategy = "skip"
 
-    setup_logger("lightrag", level=os.getenv("LOG_LEVEL", "INFO"))
+    # Handle force re-indexing: clear storage directory if it exists
+    if reindex_strategy == "force" and os.path.exists(working_dir):
+        logger.info(
+            f"Force re-indexing enabled: clearing existing storage at {working_dir}"
+        )
+        import shutil
+        shutil.rmtree(working_dir)
+        logger.info(f"Cleared storage directory: {working_dir}")
+
+    # Setup logging based on config (can be overridden by LOG_LEVEL env var)
+    lightrag_level = os.getenv("LOG_LEVEL", config.lightrag_log_level)
+    setup_logger("lightrag", level=lightrag_level)
+
+    # [WNC] Set verbose debug mode from config
+    if config.verbose_debug:
+        import lightrag.utils
+        lightrag.utils.VERBOSE_DEBUG = True
+
     # [WNC] Use time_only=True to show only time (09:20:06,054) instead of full datetime
     enable_console_timestamps("lightrag", time_only=True)
     enable_wnc_prefix("lightrag", script_name="openai_test.py")
@@ -182,13 +205,13 @@ def main() -> None:
         raise SystemExit(f"Missing {api_key_env} in environment.")
 
     logger.info(
-        "Run config: config=%s working_dir=%s kdb_dir=%s backend=%s mode=%s skip_index=%s",
+        "Run config: config=%s working_dir=%s kdb_dir=%s backend=%s mode=%s reindex_strategy=%s",
         args.config,
         working_dir,
         kdb_dir,
         config.ingest.backend,
         mode,
-        skip_index,
+        reindex_strategy,
     )
     if config.ingest.backend == "raganything":
         ra = config.ingest.raganything
@@ -331,6 +354,8 @@ def main() -> None:
         llm_model_name=config.openai.chat_model,
         embedding_func=embedding_func,
         max_parallel_insert=int(getattr(config, "max_parallel_insert", 2)),
+        enable_llm_cache=config.enable_llm_cache,
+        enable_llm_cache_for_entity_extract=config.enable_llm_cache_for_entity_extract,
     )
 
     # LightRAG requires explicit storage lifecycle management.
