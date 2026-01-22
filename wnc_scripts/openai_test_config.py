@@ -81,6 +81,11 @@ class OpenAITestConfig:
     wnc_log_level: Literal["trace", "debug", "info", "warning", "error"] = "trace"
     # Enable verbose debug mode (adds extra detailed logging)
     verbose_debug: bool = True
+    # WNC log delimiter: separator between log fields
+    # - "pipe": use " | " (compact, single line)
+    # - "newline": use "\n  " (multi-line, easier to read)
+    # - "comma": use ", " (CSV-like)
+    wnc_log_delimiter: Literal["pipe", "newline", "comma"] = "newline"
 
     # Cache configuration
     # Enable LLM response caching to avoid redundant API calls

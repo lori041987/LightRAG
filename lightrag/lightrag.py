@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import traceback
 import asyncio
 import configparser
@@ -450,8 +451,7 @@ class LightRAG:
 
         # [WNC] Log function entry
         wnc_log(
-            function_name="LightRAG.__post_init__",
-            purpose="Validate config, wrap embedding func with concurrency limits, and instantiate storages",
+            purpose="Initializes LightRAG instance by validating configuration, instantiating storage backends, and wrapping embedding function with concurrency limits",
             inputs={
                 "working_dir": self.working_dir,
                 "kv_storage": self.kv_storage,
@@ -459,8 +459,9 @@ class LightRAG:
                 "graph_storage": self.graph_storage,
                 "llm_model_name": getattr(self, "llm_model_name", None),
             },
-            note="Creates working_dir if missing; initializes JsonKVStorage, NanoVectorDBStorage, NetworkXStorage, JsonDocStatusStorage",
-            level="info",
+            side_effects="Creates working_dir if it does not exist; instantiates storage objects (does not load data until initialize_storages is called)",
+            note="Validates storage backend compatibility and environment variables; wraps embedding_func with priority_limit_async_func_call for concurrency control; deprecated log_level/log_file_path parameters are removed after warning",
+            level="trace"
         )
 
         # Handle deprecated parameters
@@ -1152,18 +1153,34 @@ class LightRAG:
         Returns:
             str: tracking ID for monitoring processing status
         """
-        # [WNC] Log function entry
+        # [WNC] Log function entry with detailed parameters
+        input_summary = (
+            f"single_doc(len={len(input)})" if isinstance(input, str)
+            else f"list[{len(input)} docs]"
+        )
+        ids_summary = (
+            ids if isinstance(ids, str)
+            else (json.dumps(ids) if ids else "None (will generate)")
+        )
+        file_paths_summary = (
+            file_paths if isinstance(file_paths, str)
+            else (json.dumps(file_paths) if file_paths else "None")
+        )
+
         wnc_log(
-            function_name="LightRAG.insert",
-            purpose="Sync wrapper that runs ainsert in an event loop",
+            purpose="Synchronous entry point for inserting documents into LightRAG by wrapping the async ainsert method",
             inputs={
-                "input": input if isinstance(input, str) else f"list[{len(input)} docs]",
-                "ids": ids,
-                "file_paths": file_paths,
-                "track_id": track_id,
+                "input": input_summary,
+                "split_by_character": split_by_character if split_by_character else "None",
+                "split_by_character_only": split_by_character_only,
+                "chunk_token_size": self.chunk_token_size,
+                "ids": ids_summary,
+                "file_paths": file_paths_summary,
+                "track_id": track_id if track_id else "None (will generate)",
             },
-            note="Calls ainsert via always_get_an_event_loop().run_until_complete()",
-            level="info",
+            side_effects="None (delegates to ainsert which writes to KV stores, vector DBs, and graph storage via working_dir)",
+            note="Runs ainsert in an event loop via always_get_an_event_loop().run_until_complete(); event loop persists across calls on the same thread",
+            level="trace"
         )
 
         loop = always_get_an_event_loop()
@@ -1206,19 +1223,37 @@ class LightRAG:
         if track_id is None:
             track_id = generate_track_id("insert")
 
-        # [WNC] Log function entry
+        # [WNC] Log function entry with detailed parameters
+        input_summary = (
+            f"single_doc(len={len(input)})" if isinstance(input, str)
+            else f"list[{len(input)} docs]"
+        )
+        ids_summary = (
+            ids if isinstance(ids, str)
+            else (json.dumps(ids) if ids else "None (will generate)")
+        )
+        file_paths_summary = (
+            file_paths if isinstance(file_paths, str)
+            else (json.dumps(file_paths) if file_paths else "None")
+        )
+
         wnc_log(
-            function_name="LightRAG.ainsert",
-            purpose="Generate track_id (if missing), enqueue docs, then process queued docs",
+            purpose="Orchestrates the full document indexing pipeline by generating track_id, enqueueing documents, and processing them through chunking and entity extraction",
             inputs={
-                "input": input if isinstance(input, str) else f"list[{len(input)} docs]",
-                "ids": ids if isinstance(ids, str) else (f"list[{len(ids)} ids]" if ids else None),
-                "file_paths": file_paths if isinstance(file_paths, str) else (f"list[{len(file_paths)} paths]" if file_paths else None),
+                "input": input_summary,
+                "split_by_character": split_by_character if split_by_character else "None",
+                "split_by_character_only": split_by_character_only,
+                "chunk_token_size": self.chunk_token_size,
+                "ids": ids_summary,
+                "file_paths": file_paths_summary,
                 "track_id": track_id,
             },
             outputs=f"track_id={track_id}",
-            note="Kicks off status writes + vector db writes + graph writes downstream",
-            level="info",
+            side_effects="Creates/updates KV_STORE_FULL_DOCS (e.g. kv_store_full_docs.json), DOC_STATUS (e.g. kv_store_doc_status.json) via enqueue.\n"
+                        "Creates/updates KV_STORE_TEXT_CHUNKS (e.g. kv_store_text_chunks.json), KV_STORE_LLM_RESPONSE_CACHE (e.g. kv_store_llm_response_cache.json), KV_STORE_FULL_ENTITIES (e.g. kv_store_full_entities.json), KV_STORE_FULL_RELATIONS (e.g. kv_store_full_relations.json), KV_STORE_ENTITY_CHUNKS (e.g. kv_store_entity_chunks.json), KV_STORE_RELATION_CHUNKS (e.g. kv_store_relation_chunks.json), VECTOR_STORE_CHUNKS (e.g. vdb_chunks.json), VECTOR_STORE_ENTITIES (e.g. vdb_entities.json), VECTOR_STORE_RELATIONSHIPS (e.g. vdb_relationships.json), GRAPH_STORE_CHUNK_ENTITY_RELATION (e.g. graph_chunk_entity_relation.graphml) via process pipeline.\n"
+                        "Storage location depends on configured backend (default: working_dir for JSON/file-based).",
+            note="If enqueue finds no new docs, it returns early with a warning; processing still runs but may find nothing to process.",
+            level="trace"
         )
 
         # [WNC] Stage annotation: clarify whether Indexing may use LLM/embeddings.
@@ -1345,6 +1380,25 @@ class LightRAG:
             ids = [ids]
         if isinstance(file_paths, str):
             file_paths = [file_paths]
+
+        # [WNC] Log function entry with detailed parameters
+        wnc_log(
+            purpose="Enqueues documents for indexing by deduplicating content, generating or validating IDs, creating initial PENDING status entries, and persisting to storage",
+            inputs={
+                "input": f"list[{len(input)} docs]",
+                "ids": json.dumps(ids) if ids else "None (will generate MD5 hash)",
+                "file_paths": json.dumps(file_paths) if file_paths else "None (will use placeholder)",
+                "track_id": track_id,
+            },
+            outputs=f"track_id={track_id}",
+            side_effects="Writes/updates KV_STORE_FULL_DOCS (e.g. kv_store_full_docs.json) with document content.\n"
+                        "Writes/updates DOC_STATUS (e.g. kv_store_doc_status.json) with status=PENDING, content_summary, content_length, file_path, track_id, timestamps.\n"
+                        "Storage location depends on configured backend.",
+            note="Raises ValueError if len(file_paths)!=len(input), ids length mismatch, or ids non-unique.\n"
+                 "Deduplicates by sanitized content; later duplicates are dropped, which may drop some provided IDs.\n"
+                 "Filters out already-enqueued doc IDs using doc_status.filter_keys before writing.",
+            level="trace"
+        )
 
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
@@ -1676,6 +1730,26 @@ class LightRAG:
         4. Process each chunk for entity and relation extraction
         5. Update the document status
         """
+        # [WNC] Log function entry
+        wnc_log(
+            purpose="Processes queued documents through the full indexing pipeline by chunking content, extracting entities/relationships via LLM, merging into knowledge graph, and updating status",
+            inputs={
+                "split_by_character": split_by_character if split_by_character else "None (token-based)",
+                "split_by_character_only": split_by_character_only,
+            },
+            outputs="None",
+            side_effects="Writes/updates DOC_STATUS (e.g. kv_store_doc_status.json) with status transitions PENDING/FAILED→PROCESSING→PROCESSED/FAILED.\n"
+                        "Writes/updates KV_STORE_TEXT_CHUNKS (e.g. kv_store_text_chunks.json), KV_STORE_LLM_RESPONSE_CACHE (e.g. kv_store_llm_response_cache.json).\n"
+                        "Writes/updates KV_STORE_FULL_ENTITIES, KV_STORE_FULL_RELATIONS, KV_STORE_ENTITY_CHUNKS, KV_STORE_RELATION_CHUNKS.\n"
+                        "Writes/updates VECTOR_STORE_CHUNKS, VECTOR_STORE_ENTITIES, VECTOR_STORE_RELATIONSHIPS (e.g. vdb_*.json).\n"
+                        "Writes/updates GRAPH_STORE_CHUNK_ENTITY_RELATION (e.g. graph_chunk_entity_relation.graphml).\n"
+                        "Updates pipeline_status shared namespace (busy flag, progress tracking).\n"
+                        "Storage location depends on configured backend.",
+            note="Single-worker queue processor with concurrency limit (max_parallel_insert).\n"
+                 "If another process is busy, sets request_pending flag and returns early.\n"
+                 "Cancellable via pipeline_status['cancellation_requested'].",
+            level="trace",
+        )
 
         # Get pipeline status shared data and lock
         pipeline_status = await get_namespace_data(
@@ -1808,6 +1882,33 @@ class LightRAG:
                     semaphore: asyncio.Semaphore,
                 ) -> None:
                     """Process single document"""
+                    # [WNC] Log function entry
+                    file_path_preview = getattr(status_doc, "file_path", "unknown_source")
+                    wnc_log(
+                        purpose="Processes a single document through the complete indexing pipeline including chunking, embedding, entity extraction, graph merging, and status updates",
+                        inputs={
+                            "doc_id": doc_id,
+                            "file_path": file_path_preview,
+                            "status": getattr(status_doc, "status", "unknown"),
+                            "split_by_character": split_by_character if split_by_character else "None",
+                            "split_by_character_only": split_by_character_only,
+                        },
+                        outputs="None",
+                        side_effects="Writes/updates DOC_STATUS (e.g. kv_store_doc_status.json) with status PENDING→PROCESSING→PROCESSED/FAILED, chunks_list, timestamps.\n"
+                                    "Writes/updates KV_STORE_TEXT_CHUNKS (e.g. kv_store_text_chunks.json) with chunk content, tokens, chunk_order_index, full_doc_id, llm_cache_list.\n"
+                                    "Writes/updates VECTOR_STORE_CHUNKS (e.g. vdb_chunks.json) with chunk embeddings.\n"
+                                    "Writes/updates KV_STORE_LLM_RESPONSE_CACHE (e.g. kv_store_llm_response_cache.json) with entity extraction results.\n"
+                                    "Writes/updates KV_STORE_ENTITY_CHUNKS, KV_STORE_RELATION_CHUNKS, KV_STORE_FULL_ENTITIES, KV_STORE_FULL_RELATIONS.\n"
+                                    "Writes/updates VECTOR_STORE_ENTITIES, VECTOR_STORE_RELATIONSHIPS (e.g. vdb_entities.json, vdb_relationships.json).\n"
+                                    "Writes/updates GRAPH_STORE_CHUNK_ENTITY_RELATION (e.g. graph_chunk_entity_relation.graphml).\n"
+                                    "Calls _insert_done to flush all storage updates to disk.\n"
+                                    "Storage location depends on configured backend.",
+                        note="Chunking function must return list/tuple or raises TypeError.\n"
+                             "On failure, status set to FAILED and error_msg recorded in doc_status.\n"
+                             "Cancellable via pipeline_status['cancellation_requested'].",
+                        level="trace",
+                    )
+
                     # Initialize variables at the start to prevent UnboundLocalError in error handling
                     file_path = "unknown_source"
                     current_file_number = 0
@@ -2250,6 +2351,24 @@ class LightRAG:
     async def _process_extract_entities(
         self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
     ) -> list:
+        # [WNC] Log function entry
+        chunk_keys = list(chunk.keys()) if chunk else []
+        wnc_log(
+            purpose="Extracts entities and relationships from text chunks using LLM, caches results, and updates chunk metadata with cache references",
+            inputs={
+                "chunk_count": len(chunk_keys),
+                "chunk_ids": chunk_keys if len(chunk_keys) <= 3 else f"{chunk_keys[:3]}... ({len(chunk_keys)} total)",
+            },
+            outputs="list[(maybe_nodes, maybe_edges)] - extraction results per chunk",
+            side_effects="Writes/updates KV_STORE_LLM_RESPONSE_CACHE (e.g. kv_store_llm_response_cache.json) with LLM extraction responses keyed by prompt hash.\n"
+                        "Writes/updates KV_STORE_TEXT_CHUNKS (e.g. kv_store_text_chunks.json) with llm_cache_list field containing cache keys for each chunk.\n"
+                        "Storage location depends on configured backend.",
+            note="Uses llm_response_cache to avoid redundant LLM calls for identical prompts.\n"
+                 "On first exception during chunk processing, cancels remaining tasks and raises prefixed exception.\n"
+                 "Updates pipeline_status with progress messages.",
+            level="trace",
+        )
+
         try:
             chunk_results = await extract_entities(
                 chunk,

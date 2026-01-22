@@ -187,10 +187,20 @@ def main() -> None:
     lightrag_level = os.getenv("LOG_LEVEL", config.lightrag_log_level)
     setup_logger("lightrag", level=lightrag_level)
 
+    # Setup WNC logger separately using setup_logger to get same format
+    import lightrag.wnc.wnc_logging  # Import to register TRACE level
+    setup_logger("lightrag.wnc", level=config.wnc_log_level.upper(), enable_file_logging=False)
+    enable_console_timestamps("lightrag.wnc", time_only=True)
+
     # [WNC] Set verbose debug mode from config
     if config.verbose_debug:
         import lightrag.utils
         lightrag.utils.VERBOSE_DEBUG = True
+
+    # [WNC] Set WNC log delimiter from config
+    from lightrag.wnc import set_delimiter
+    wnc_delimiter = getattr(config, "wnc_log_delimiter", "pipe")
+    set_delimiter(wnc_delimiter)
 
     # [WNC] Use time_only=True to show only time (09:20:06,054) instead of full datetime
     enable_console_timestamps("lightrag", time_only=True)
