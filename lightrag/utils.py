@@ -42,6 +42,7 @@ from lightrag.constants import (
     VALID_SOURCE_IDS_LIMIT_METHODS,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
 )
+from lightrag.wnc import wnc_log
 
 # Precompile regex pattern for JSON sanitization (module-level, compiled once)
 _SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
@@ -584,7 +585,28 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
 
     The ID is a combination of the given prefix and the MD5 hash of the content string.
     """
-    return prefix + compute_args_hash(content)
+
+    # [WNC] Log function entry
+    wnc_log(
+        purpose="Generates deterministic unique ID by computing MD5 hash of content and prepending prefix",
+        inputs={
+            "content": content,
+            "prefix": prefix if prefix else "'' (no prefix)",
+        },
+        side_effects="None",
+        note="Used for generating IDs: doc-*, chunk-*, ent-*, rel-*.\n"
+             "Deterministic: same content always produces same ID.\n"
+             "Delegates to compute_args_hash for MD5 computation with safe unicode handling.",
+        level="trace",
+    )
+
+    result = prefix + compute_args_hash(content)
+    wnc_log(
+        purpose="[OUTPUT] compute_mdhash_id completed",
+        outputs={"id": result},
+        level="trace",
+    )
+    return result
 
 
 def generate_cache_key(mode: str, cache_type: str, hash_value: str) -> str:
@@ -1997,6 +2019,26 @@ async def use_llm_func_with_cache(
             - For cache hits: (content, cache_create_time)
             - For cache misses: (content, current_timestamp)
     """
+    # [WNC] Log function entry
+    wnc_log(
+        purpose="Calls LLM with cache support by checking llm_response_cache for existing response matching prompt hash, returning cached result if found, otherwise calling LLM and saving response to cache",
+        inputs={
+            "system_prompt": system_prompt if system_prompt else "None",
+            "user_prompt": user_prompt,
+            "history_messages": history_messages if history_messages else "None",
+            "cache_type": cache_type,
+            "chunk_id": chunk_id if chunk_id else "None",
+            "llm_response_cache": "provided" if llm_response_cache else "None (cache disabled)",
+        },
+        side_effects="Reads from KV_STORE_LLM_RESPONSE_CACHE via handle_cache (if cache enabled).\n"
+                    "Writes to KV_STORE_LLM_RESPONSE_CACHE via save_to_cache (if cache miss and enable_llm_cache_for_entity_extract=True).\n"
+                    "Storage location depends on configured backend (default: kv_store_llm_response_cache.json).",
+        note="Has 3 branches: cache hit (read only), cache miss (read + write), cache disabled (no cache ops).\n"
+             "Sanitizes all prompts via sanitize_text_for_encoding before hashing/LLM call.\n"
+             "Wraps uncached LLM exceptions with [LLM func] prefix when cache disabled.",
+        level="info",
+    )
+
     # Sanitize input text to prevent UTF-8 encoding errors for all LLM providers
     safe_user_prompt = sanitize_text_for_encoding(user_prompt)
     safe_system_prompt = (
@@ -2046,6 +2088,13 @@ async def use_llm_func_with_cache(
             if cache_keys_collector is not None:
                 cache_keys_collector.append(cache_key)
 
+            # [WNC] Log cache hit output
+            wnc_log(
+                purpose="[OUTPUT] Cache hit branch",
+                outputs={"cache_hit": True, "arg_hash": arg_hash, "cache_key": cache_key, "content": content, "timestamp": timestamp},
+                level="info",
+            )
+
             return content, timestamp
         statistic_data["llm_call"] += 1
 
@@ -2081,6 +2130,13 @@ async def use_llm_func_with_cache(
             if cache_keys_collector is not None:
                 cache_keys_collector.append(cache_key)
 
+        # [WNC] Log cache miss output
+        wnc_log(
+            purpose="[OUTPUT] Cache miss branch",
+            outputs={"cache_hit": False, "llm_called": True, "arg_hash": arg_hash, "cache_key": cache_key, "content": res, "timestamp": current_timestamp, "saved_to_cache": llm_response_cache.global_config.get("enable_llm_cache_for_entity_extract")},
+            level="info",
+        )
+
         return res, current_timestamp
 
     # When cache is disabled, directly call LLM with sanitized input
@@ -2102,6 +2158,14 @@ async def use_llm_func_with_cache(
 
     # Generate timestamp for non-cached LLM call
     current_timestamp = int(time.time())
+
+    # [WNC] Log cache disabled output
+    wnc_log(
+        purpose="[OUTPUT] Cache disabled branch",
+        outputs={"cache_disabled": True, "llm_called": True, "content": remove_think_tags(res), "timestamp": current_timestamp},
+        level="info",
+    )
+
     return remove_think_tags(res), current_timestamp
 
 
@@ -2115,10 +2179,36 @@ def get_content_summary(content: str, max_length: int = 250) -> str:
     Returns:
         Truncated content with ellipsis if needed
     """
+    # [WNC] Log function entry
+    wnc_log(
+        purpose="Creates short preview of document content for display in document status entries",
+        inputs={
+            "content": content,
+            "content length": len(content),
+            "max_length": max_length,
+        },
+        side_effects="None",
+        note="Truncates content to max_length and appends '...' if truncated.\n"
+             "Used when creating initial DOC_STATUS entries during enqueue.\n"
+             "Provides human-readable preview without storing full document content in status.",
+        level="info",
+    )
     content = content.strip()
     if len(content) <= max_length:
+        wnc_log(
+            purpose="[OUTPUT] No truncation needed",
+            outputs={"summary": content, "truncated": False},
+            level="info",
+        )
         return content
-    return content[:max_length] + "..."
+
+    result = content[:max_length] + "..."
+    wnc_log(
+        purpose="[OUTPUT] Content truncated",
+        outputs={"summary": result, "truncated": True, "original length": len(content)},
+        level="info",
+    )
+    return result
 
 
 def sanitize_and_normalize_extracted_text(
@@ -2297,7 +2387,27 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
     Raises:
         ValueError: When text contains uncleanable encoding issues that cannot be safely processed
     """
+    # [WNC] Log function entry
+    wnc_log(
+        purpose="Removes or replaces problematic Unicode characters to prevent downstream UTF-8 encoding failures",
+        inputs={
+            "text": text,
+            "replacement_char": repr(replacement_char),
+        },
+        side_effects="None",
+        note="Handles surrogate characters (0xD800-0xDFFF), invalid Unicode (0xFFFE, 0xFFFF), control characters (0x00-0x1F, 0x7F).\n"
+             "Used for sanitizing document content before deduplication and LLM prompts before caching.\n"
+             "Raises ValueError if text contains uncleanable encoding issues.\n"
+             "Has 4 return branches: empty input, empty after strip, successful sanitization, exception fallback.",
+        level="trace",
+    )
+
     if not text:
+        wnc_log(
+            purpose="[OUTPUT] Empty input",
+            outputs={"result": "", "reason": "input empty"},
+            level="trace",
+        )
         return text
 
     try:
@@ -2306,6 +2416,11 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
 
         # Early return if text is empty after basic cleaning
         if not text:
+            wnc_log(
+                purpose="[OUTPUT] Empty after strip",
+                outputs={"result": "", "reason": "empty after strip"},
+                level="trace",
+            )
             return text
 
         # Try to encode/decode to catch any encoding issues early
@@ -2344,6 +2459,11 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
         # Remove control characters but preserve common whitespace (\t, \n, \r)
         sanitized = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]", "", sanitized)
 
+        wnc_log(
+            purpose="[OUTPUT] Sanitized and stripped",
+            outputs={"result": sanitized.strip(), "reason": "sanitized and stripped whitespace"},
+            level="trace",
+        )
         return sanitized.strip()
 
     except UnicodeEncodeError as e:
@@ -2357,6 +2477,11 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
         # For other exceptions, if no encoding issues detected, return original text
         try:
             text.encode("utf-8")
+            wnc_log(
+                purpose="[OUTPUT] Exception fallback - original text has no encoding issues",
+                outputs={"result": text, "reason": "exception fallback, text valid"},
+                level="trace",
+            )
             return text
         except UnicodeEncodeError:
             raise ValueError(
@@ -2999,8 +3124,26 @@ def generate_track_id(prefix: str = "upload") -> str:
     Returns:
         str: Unique tracking ID in format: {prefix}_{timestamp}_{uuid}
     """
+    # [WNC] Log function entry
+    wnc_log(
+        purpose="Generates unique tracking ID with timestamp and UUID for monitoring document processing status",
+        inputs={
+            "prefix": prefix,
+        },
+        side_effects="None",
+        note="Format: {prefix}_{timestamp}_{uuid8} (e.g., insert_20260123_143256_a1b2c3d4).\n"
+             "Used to track document processing across enqueue/process pipeline stages.\n"
+             "Stored in DOC_STATUS entries.",
+        level="info",
+    )
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_id = str(uuid.uuid4())[:8]  # Use first 8 characters of UUID
+
+    wnc_log(
+        purpose="[OUTPUT] generate_track_id completed",
+        outputs={"track id": f"{prefix}_{timestamp}_{unique_id}"},
+        level="info",
+    )
     return f"{prefix}_{timestamp}_{unique_id}"
 
 

@@ -177,9 +177,14 @@ def json_value_to_text(value: object) -> str:
 
 
 # [WNC] Convert JSON sample to embedding-friendly document text
-def sample_json_to_doc_text(sample: dict, include_ground_truth: bool) -> str:
+def sample_json_to_doc_text(sample: dict, include_ground_truth: bool, preprocess: bool = True) -> str:
     """
     Convert ONE JSON sample into a compact, embedding-friendly document.
+
+    Args:
+        sample: JSON sample dictionary
+        include_ground_truth: Whether to include ground_truths field
+        preprocess: If True, convert to flattened text format; if False, return raw JSON
 
     We prioritize "signal" fields:
     - metadata: id/tags/task_types
@@ -188,6 +193,15 @@ def sample_json_to_doc_text(sample: dict, include_ground_truth: bool) -> str:
 
     Tip: Usually keep `include_ground_truth=False` to avoid "training on the answer".
     """
+    # If no preprocessing, return raw JSON
+    if not preprocess:
+        import json
+        # Remove ground_truths if not included
+        if not include_ground_truth and "ground_truths" in sample:
+            sample = sample.copy()
+            del sample["ground_truths"]
+        return json.dumps(sample, indent=2, ensure_ascii=False)
+
     lines: List[str] = []
 
     for key in ("id", "tags", "task_types"):
@@ -225,7 +239,7 @@ def sample_json_to_doc_text(sample: dict, include_ground_truth: bool) -> str:
 
 # [WNC] Load and format JSON documents from knowledge base directory
 def load_json_docs(
-    kdb_dir: Path, include_ground_truth: bool
+    kdb_dir: Path, include_ground_truth: bool, preprocess_json: bool = True
 ) -> Tuple[List[str], List[str]]:
     """Load and format all `*.json` files under `kdb_dir`."""
     docs: List[str] = []
@@ -242,7 +256,7 @@ def load_json_docs(
             logger.warning("Skipping %s: top-level JSON is not an object", path)
             continue
 
-        doc_text = sample_json_to_doc_text(sample, include_ground_truth)
+        doc_text = sample_json_to_doc_text(sample, include_ground_truth, preprocess_json)
         if not doc_text.strip():
             logger.warning("Skipping %s: empty doc text after formatting", path)
             continue
@@ -317,6 +331,7 @@ def load_mixed_docs(
     include_ground_truth: bool,
     allow_pdf: bool,
     pdf_extractor: str,
+    preprocess_json: bool = True,
 ) -> Tuple[List[str], List[str]]:
     """
     Load documents from a directory tree.
@@ -342,7 +357,7 @@ def load_mixed_docs(
                         "Skipping %s: top-level JSON is not an object", path
                     )
                     continue
-                doc_text = sample_json_to_doc_text(sample, include_ground_truth)
+                doc_text = sample_json_to_doc_text(sample, include_ground_truth, preprocess_json)
                 if not doc_text.strip():
                     logger.warning(
                         "Skipping %s: empty doc text after formatting", path
@@ -406,7 +421,7 @@ def load_docs_with_textract(
                         "Skipping %s: top-level JSON is not an object", path
                     )
                     continue
-                doc_text = sample_json_to_doc_text(sample, include_ground_truth)
+                doc_text = sample_json_to_doc_text(sample, include_ground_truth, preprocess_json)
                 if not doc_text.strip():
                     logger.warning(
                         "Skipping %s: empty doc text after formatting", path

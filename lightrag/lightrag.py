@@ -459,6 +459,7 @@ class LightRAG:
                 "graph_storage": self.graph_storage,
                 "llm_model_name": getattr(self, "llm_model_name", None),
             },
+            outputs=None,
             side_effects="Creates working_dir if it does not exist; instantiates storage objects (does not load data until initialize_storages is called)",
             note="Validates storage backend compatibility and environment variables; wraps embedding_func with priority_limit_async_func_call for concurrency control; deprecated log_level/log_file_path parameters are removed after warning",
             level="trace"
@@ -687,6 +688,28 @@ class LightRAG:
 
     async def initialize_storages(self):
         """Storage initialization must be called one by one to prevent deadlock"""
+        # [WNC] Log function entry
+        wnc_log(
+            purpose="Initializes all storage backends by loading existing data from disk into memory and setting up pipeline status for the workspace",
+            inputs={
+                "workspace": self.workspace,
+                "_storages_status": self._storages_status,
+            },
+            outputs=None,
+            side_effects="Reads existing storage data (if present) into memory for all configured backends.\n"
+                        "For JSON backend: reads kv_store_*.json, vdb_*.json, graph_*.graphml from working_dir.\n"
+                        "For other backends (Redis, Postgres, etc.): loads data from respective backend stores.\n"
+                        "Initializes pipeline_status shared namespace for workspace to track indexing progress.\n"
+                        "Sets default workspace if not already set (for backward compatibility).\n"
+                        "Storage location depends on configured backend.",
+            note="Must be called before any indexing or query operations.\n"
+                 "Storages are initialized sequentially to prevent deadlock.\n"
+                 "If _storages_status is not CREATED, initialization is skipped (idempotent).\n"
+                 "Initializes 12 storage objects: full_docs, text_chunks, full_entities, full_relations, entity_chunks, relation_chunks, entities_vdb, relationships_vdb, chunks_vdb, chunk_entity_relation_graph, llm_response_cache, doc_status.\n"
+                 "Updates _storages_status to INITIALIZED upon completion.",
+            level="info",
+        )
+
         if self._storages_status == StoragesStatus.CREATED:
             # Set the first initialized workspace will set the default workspace
             # Allows namespace operation without specifying workspace for backward compatibility
@@ -1106,27 +1129,69 @@ class LightRAG:
         )
 
     def _get_storage_class(self, storage_name: str) -> Callable[..., Any]:
+        # [WNC] Log function entry
+        wnc_log(
+            purpose="Resolves storage backend name to storage class by importing default implementations or dynamically loading external backends",
+            inputs={
+                "storage_name": storage_name,
+            },
+            side_effects="Imports backend modules (e.g., json_kv_impl, nano_vector_db_impl, networkx_impl).\n"
+                        "For non-default backends, uses lazy_external_import with STORAGES mapping from lightrag/kg/__init__.py.\n"
+                        "No file I/O; only module imports.",
+            note="Raises KeyError if storage_name not in default list and not present in STORAGES dict.\n"
+                 "Default implementations: JsonKVStorage, NanoVectorDBStorage, NetworkXStorage, JsonDocStatusStorage.\n"
+                 "External backends (Redis, Postgres, Milvus, etc.) are loaded dynamically via STORAGES mapping.\n"
+                 "Has 5 return branches for different storage types.",
+            level="info",
+        )
+
         # Direct imports for default storage implementations
         if storage_name == "JsonKVStorage":
             from lightrag.kg.json_kv_impl import JsonKVStorage
 
+            wnc_log(
+                purpose="[OUTPUT] JsonKVStorage branch",
+                outputs={"storage_name": storage_name, "storage_class": "JsonKVStorage"},
+                level="info",
+            )
             return JsonKVStorage
         elif storage_name == "NanoVectorDBStorage":
             from lightrag.kg.nano_vector_db_impl import NanoVectorDBStorage
 
+            wnc_log(
+                purpose="[OUTPUT] NanoVectorDBStorage branch",
+                outputs={"storage_name": storage_name, "storage_class": "NanoVectorDBStorage"},
+                level="info",
+            )
             return NanoVectorDBStorage
         elif storage_name == "NetworkXStorage":
             from lightrag.kg.networkx_impl import NetworkXStorage
 
+            wnc_log(
+                purpose="[OUTPUT] NetworkXStorage branch",
+                outputs={"storage_name": storage_name, "storage_class": "NetworkXStorage"},
+                level="info",
+            )
             return NetworkXStorage
         elif storage_name == "JsonDocStatusStorage":
             from lightrag.kg.json_doc_status_impl import JsonDocStatusStorage
 
+            wnc_log(
+                purpose="[OUTPUT] JsonDocStatusStorage branch",
+                outputs={"storage_name": storage_name, "storage_class": "JsonDocStatusStorage"},
+                level="info",
+            )
             return JsonDocStatusStorage
         else:
             # Fallback to dynamic import for other storage implementations
             import_path = STORAGES[storage_name]
             storage_class = lazy_external_import(import_path, storage_name)
+
+            wnc_log(
+                purpose="[OUTPUT] Dynamic import branch",
+                outputs={"storage_name": storage_name, "storage_class": storage_class.__name__, "import_path": import_path},
+                level="info",
+            )
             return storage_class
 
     def insert(
@@ -1184,7 +1249,7 @@ class LightRAG:
         )
 
         loop = always_get_an_event_loop()
-        return loop.run_until_complete(
+        track_id_result = loop.run_until_complete(
             self.ainsert(
                 input,
                 split_by_character,
@@ -1194,6 +1259,13 @@ class LightRAG:
                 track_id,
             )
         )
+
+        wnc_log(
+            purpose="[OUTPUT] insert completed",
+            outputs={"track_id": track_id_result},
+            level="info",
+        )
+        return track_id_result
 
     async def ainsert(
         self,
@@ -1248,11 +1320,11 @@ class LightRAG:
                 "file_paths": file_paths_summary,
                 "track_id": track_id,
             },
-            outputs=f"track_id={track_id}",
             side_effects="Creates/updates KV_STORE_FULL_DOCS (e.g. kv_store_full_docs.json), DOC_STATUS (e.g. kv_store_doc_status.json) via enqueue.\n"
                         "Creates/updates KV_STORE_TEXT_CHUNKS (e.g. kv_store_text_chunks.json), KV_STORE_LLM_RESPONSE_CACHE (e.g. kv_store_llm_response_cache.json), KV_STORE_FULL_ENTITIES (e.g. kv_store_full_entities.json), KV_STORE_FULL_RELATIONS (e.g. kv_store_full_relations.json), KV_STORE_ENTITY_CHUNKS (e.g. kv_store_entity_chunks.json), KV_STORE_RELATION_CHUNKS (e.g. kv_store_relation_chunks.json), VECTOR_STORE_CHUNKS (e.g. vdb_chunks.json), VECTOR_STORE_ENTITIES (e.g. vdb_entities.json), VECTOR_STORE_RELATIONSHIPS (e.g. vdb_relationships.json), GRAPH_STORE_CHUNK_ENTITY_RELATION (e.g. graph_chunk_entity_relation.graphml) via process pipeline.\n"
                         "Storage location depends on configured backend (default: working_dir for JSON/file-based).",
-            note="If enqueue finds no new docs, it returns early with a warning; processing still runs but may find nothing to process.",
+            note="If enqueue finds no new docs, it returns early with a warning; processing still runs but may find nothing to process.\n"
+                 "Returns track_id for monitoring processing status.",
             level="trace"
         )
 
@@ -1273,6 +1345,11 @@ class LightRAG:
             split_by_character, split_by_character_only
         )
 
+        wnc_log(
+            purpose="[OUTPUT] ainsert completed",
+            outputs={"track_id": track_id},
+            level="info",
+        )
         return track_id
 
     # TODO: deprecated, use insert instead
@@ -1737,7 +1814,7 @@ class LightRAG:
                 "split_by_character": split_by_character if split_by_character else "None (token-based)",
                 "split_by_character_only": split_by_character_only,
             },
-            outputs="None",
+            outputs=None,
             side_effects="Writes/updates DOC_STATUS (e.g. kv_store_doc_status.json) with status transitions PENDING/FAILED→PROCESSING→PROCESSED/FAILED.\n"
                         "Writes/updates KV_STORE_TEXT_CHUNKS (e.g. kv_store_text_chunks.json), KV_STORE_LLM_RESPONSE_CACHE (e.g. kv_store_llm_response_cache.json).\n"
                         "Writes/updates KV_STORE_FULL_ENTITIES, KV_STORE_FULL_RELATIONS, KV_STORE_ENTITY_CHUNKS, KV_STORE_RELATION_CHUNKS.\n"
@@ -1748,7 +1825,7 @@ class LightRAG:
             note="Single-worker queue processor with concurrency limit (max_parallel_insert).\n"
                  "If another process is busy, sets request_pending flag and returns early.\n"
                  "Cancellable via pipeline_status['cancellation_requested'].",
-            level="trace",
+            level="info",
         )
 
         # Get pipeline status shared data and lock
@@ -1893,7 +1970,7 @@ class LightRAG:
                             "split_by_character": split_by_character if split_by_character else "None",
                             "split_by_character_only": split_by_character_only,
                         },
-                        outputs="None",
+                        outputs=None,
                         side_effects="Writes/updates DOC_STATUS (e.g. kv_store_doc_status.json) with status PENDING→PROCESSING→PROCESSED/FAILED, chunks_list, timestamps.\n"
                                     "Writes/updates KV_STORE_TEXT_CHUNKS (e.g. kv_store_text_chunks.json) with chunk content, tokens, chunk_order_index, full_doc_id, llm_cache_list.\n"
                                     "Writes/updates VECTOR_STORE_CHUNKS (e.g. vdb_chunks.json) with chunk embeddings.\n"
@@ -1906,7 +1983,7 @@ class LightRAG:
                         note="Chunking function must return list/tuple or raises TypeError.\n"
                              "On failure, status set to FAILED and error_msg recorded in doc_status.\n"
                              "Cancellable via pipeline_status['cancellation_requested'].",
-                        level="trace",
+                        level="info",
                     )
 
                     # Initialize variables at the start to prevent UnboundLocalError in error handling
@@ -2356,7 +2433,7 @@ class LightRAG:
         wnc_log(
             purpose="Extracts entities and relationships from text chunks using LLM, caches results, and updates chunk metadata with cache references",
             inputs={
-                "chunk_count": len(chunk_keys),
+                "chunk count": len(chunk_keys),
                 "chunk_ids": chunk_keys if len(chunk_keys) <= 3 else f"{chunk_keys[:3]}... ({len(chunk_keys)} total)",
             },
             outputs="list[(maybe_nodes, maybe_edges)] - extraction results per chunk",
@@ -2366,7 +2443,7 @@ class LightRAG:
             note="Uses llm_response_cache to avoid redundant LLM calls for identical prompts.\n"
                  "On first exception during chunk processing, cancels remaining tasks and raises prefixed exception.\n"
                  "Updates pipeline_status with progress messages.",
-            level="trace",
+            level="info",
         )
 
         try:

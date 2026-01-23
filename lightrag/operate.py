@@ -41,6 +41,7 @@ from lightrag.utils import (
     make_relation_chunk_key,
     format_stage_provider_requirements,
 )
+from lightrag.wnc import wnc_log
 from lightrag.base import (
     BaseGraphStorage,
     BaseKVStorage,
@@ -105,6 +106,24 @@ def chunking_by_token_size(
     chunk_overlap_token_size: int = 100,
     chunk_token_size: int = 1200,
 ) -> list[dict[str, Any]]:
+    # [WNC] Log function entry
+    wnc_log(
+        purpose="Splits document content into overlapping token-based chunks with optional character-based pre-splitting",
+        inputs={
+            "content": content,
+            "content length": len(content),
+            "split_by_character": split_by_character if split_by_character else "None (token-based only)",
+            "split_by_character_only": split_by_character_only,
+            "chunk_overlap_token_size": chunk_overlap_token_size,
+            "chunk_token_size": chunk_token_size,
+        },
+        side_effects="None",
+        note="Default chunking strategy for LightRAG (via self.chunking_func).\n"
+             "Token-window splitting with overlap for context preservation.\n"
+             "Raises ChunkTokenLimitExceededError if split_by_character_only=True and a character-split chunk exceeds chunk_token_size.\n"
+             "Returns list[dict] with keys: tokens, content, chunk_order_index.",
+        level="info",
+    )
     tokens = tokenizer.encode(content)
     results: list[dict[str, Any]] = []
     if split_by_character:
@@ -160,6 +179,12 @@ def chunking_by_token_size(
                     "chunk_order_index": index,
                 }
             )
+
+    wnc_log(
+        purpose="[OUTPUT] chunking_by_token_size completed",
+        outputs={"chunks": results},
+        level="info",
+    )
     return results
 
 
@@ -2793,6 +2818,24 @@ async def extract_entities(
     llm_response_cache: BaseKVStorage | None = None,
     text_chunks_storage: BaseKVStorage | None = None,
 ) -> list:
+    # [WNC] Log function entry
+    wnc_log(
+        purpose="Runs chunk-parallel entity extraction via LLM, parses outputs, and returns chunk_results for merge stage",
+        inputs={
+            "chunks": chunks,
+            "llm_model_func": global_config["llm_model_func"],
+            "entity_extract_max_gleaning": global_config["entity_extract_max_gleaning"],
+            "chunk_max_async": global_config.get("llm_model_max_async", 4),
+        },
+        side_effects="Writes LLM cache entries into llm_response_cache storage.\n"
+                    "Updates llm_cache_list in text_chunks storage via update_chunk_cache_list().\n"
+                    "Storage location depends on configured backend.",
+        note="On first exception, cancels remaining chunk tasks and raises prefixed exception.\n"
+             "entity_extract_max_gleaning>0 enables one additional 'continue extraction' LLM pass per chunk.\n"
+             "Uses asyncio.Semaphore to limit concurrent chunk processing to llm_model_max_async.",
+        level="info",
+    )
+
     # Check for cancellation at the start of entity extraction
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:
@@ -3029,6 +3072,13 @@ async def extract_entities(
 
     # If all tasks completed successfully, chunk_results already contains the results
     # Return the chunk_results for later processing in merge_nodes_and_edges
+
+    # [WNC] Log output before return
+    wnc_log(
+        purpose="[OUTPUT] extract_entities completed",
+        outputs={"chunk results": chunk_results},
+        level="info",
+    )
     return chunk_results
 
 

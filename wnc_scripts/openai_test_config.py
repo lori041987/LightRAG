@@ -25,7 +25,10 @@ class RagAnythingSettings:
 @dataclass
 class IngestSettings:
     backend: Literal["simple", "textract", "raganything"] = "simple"
-    include_ground_truth: bool = False
+    include_ground_truth: bool = True
+    # Pre-process JSON files into flattened text format (key: value)
+    # If False, index raw JSON as-is
+    preprocess_json: bool = False
 
     # Only used when `backend == "simple"`
     allow_pdf: bool = True
@@ -78,7 +81,8 @@ class OpenAITestConfig:
     # LightRAG log level: DEBUG, INFO, WARNING, ERROR
     lightrag_log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "DEBUG"
     # WNC custom log level: trace, debug, info, warning, error
-    wnc_log_level: Literal["trace", "debug", "info", "warning", "error"] = "trace"
+    # "trace" will enable freq logs: sanitize_text_for_encoding(), compute_mdhash_id()
+    wnc_log_level: Literal["trace", "debug", "info", "warning", "error"] = "info"
     # Enable verbose debug mode (adds extra detailed logging)
     verbose_debug: bool = True
     # WNC log delimiter: separator between log fields
@@ -86,6 +90,9 @@ class OpenAITestConfig:
     # - "newline": use "\n  " (multi-line, easier to read)
     # - "comma": use ", " (CSV-like)
     wnc_log_delimiter: Literal["pipe", "newline", "comma"] = "newline"
+    # WNC trace log content limit: max chars to show for content in trace logs
+    # Set to 0 for unlimited, or positive int for max length
+    wnc_log_trace_content_limit: int = 10000
 
     # Cache configuration
     # Enable LLM response caching to avoid redundant API calls
