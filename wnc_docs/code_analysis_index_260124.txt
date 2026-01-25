@@ -1022,3 +1022,221 @@
     operate.py:_merge_nodes_then_upsert / lightrag/operate.py:_merge_edges_then_upsert → lightrag/lightrag.py:LightRAG._insert_done →
     (JsonKVStorage.index_done_callback, JsonDocStatusStorage.index_done_callback, NanoVectorDBStorage.index_done_callback, NetworkXStorage.index_done_callback)
 
+  # Note A: Why Token size matters ?
+
+  Because LightRAG’s “chunking” is designed to keep each chunk small enough to be safely sent to downstream model calls (embeddings, and sometimes
+  LLM prompts) and to be comparable in retrieval.
+
+  Where token size is used in code:
+
+  - The default chunker is chunking_by_token_size (lightrag/operate.py:100). It literally chunks by counting tokens:
+      - It calls tokens = tokenizer.encode(content) (lightrag/operate.py:108).
+      - If you don’t use split_by_character, it slices that token list into windows of chunk_token_size with overlap chunk_overlap_token_size (lightrag/
+        operate.py:152-160).
+  - LightRAG exposes the knobs:
+      - chunk_token_size and chunk_overlap_token_size are config fields (lightrag/lightrag.py:224-230).
+      - tokenizer is what defines what a “token” is (lightrag/lightrag.py:232-240).
+
+  Why this is necessary (practically):
+
+  - Embedding models have max input lengths in tokens. LightRAG batches chunk texts into the vector DB upsert, which calls the embedding function on content
+    (lightrag/kg/nano_vector_db_impl.py:116-126). If a chunk is too big in tokens, the embedding provider can reject it.
+  - LLM calls also have token limits. Entity extraction sends chunk text to the LLM (lightrag/operate.py:2860-2875). Keeping chunks bounded helps avoid prompt-length
+    failures and keeps per-chunk extraction focused.
+  - Chunk size affects retrieval quality. Vector search happens over chunks; if chunks are too big, one embedding represents too much mixed content; too small,
+    context fragments.
+
+  How split_by_character fits in:
+
+  - If you set split_by_character, the code splits text first by that delimiter (content.split(split_by_character) in lightrag/operate.py:111), then it still checks
+    token size.
+  - If split_by_character_only=True, each delimiter-split piece must already be under the token limit, or it raises ChunkTokenLimitExceededError (lightrag/
+    operate.py:113-126). This option exists so you can enforce “chunk boundaries must align with my delimiter” (e.g., one JSON record per chunk) and fail fast if any
+    record is too large.
+
+  # Note B: Why we need "overlap" trunk token size?
+
+  chunk_overlap_token_size means each chunk repeats the last N tokens of the previous chunk at the start of the next chunk (a sliding-window split).
+
+  Why do this:
+
+  - Prevents “boundary loss”: sentences/ideas that cross a chunk boundary still appear together in at least one chunk.
+  - Improves retrieval and generation quality: embeddings and later LLM context keep continuity, so answers don’t miss crucial surrounding text.
+  - Helps with long entities/definitions/code blocks that would otherwise get split awkwardly.
+
+  Tradeoffs:
+
+  - More chunks and more storage/compute (redundant tokens get embedded/indexed multiple times).
+  - Too-large overlap can make retrieval noisier due to near-duplicate chunks.
+
+  So overlap is there to keep semantic continuity across chunk boundaries while still respecting chunk_token_size limits.
+
+  # Note C: What are the different between JsonKVStorage.index_done_callback and JsonKVStorage.upsert
+
+  JsonKVStorage.index_done_callback
+
+  - Purpose: Persists in-memory data to disk (writes JSON file)
+  - When called: At the end of document processing, by _insert_done()
+  - Main operation: Writes self._data → disk file (e.g., kv_store_text_chunks.json)
+  - Frequency: Called once per document batch (at completion)
+  - Side effect: Disk I/O - creates/updates JSON file
+
+  JsonKVStorage.upsert
+
+  - Purpose: Updates in-memory data (modifies self._data)
+  - When called: Throughout the pipeline whenever data needs to be stored (chunks, entities, relations, etc.)
+  - Main operation: Updates self._data dictionary in memory
+  - Frequency: Called many times during processing (for each chunk, entity, relation)
+  - Side effect: Memory only - no disk I/O (disk write happens later in index_done_callback)
+
+  Analogy
+
+  Think of it like a database:
+  - upsert() = INSERT/UPDATE statements (modify in-memory cache)
+  - index_done_callback() = COMMIT (flush to disk)
+
+  The pattern is:
+  1. Multiple upsert() calls during processing → update memory
+  2. One index_done_callback() call at the end → persist to disk
+
+
+  # Note D: What are the different between _handle_entity_relation_summary and _summarize_descriptions
+
+  _handle_entity_relation_summary (orchestrator)
+
+  - Purpose: Orchestrates the entire summarization process with a map-reduce strategy
+  - When: Called when merging entities/relations with multiple descriptions
+  - Logic:
+    a. Checks if summarization is needed (based on token count and description count)
+    b. If NO: Just joins descriptions with separator, no LLM call
+    c. If YES but small enough: Calls _summarize_descriptions once
+    d. If YES and too large:
+        - Map phase: Splits descriptions into chunks
+      - Reduce phase: Calls _summarize_descriptions for each chunk
+      - Iterative: Repeats until final summary fits within limits
+  - Returns: (summary_string, llm_was_used_boolean) - tracks whether LLM was used
+
+  _summarize_descriptions (worker)
+
+  - Purpose: Actually calls the LLM to summarize a specific list of descriptions
+  - When: Called by _handle_entity_relation_summary when LLM is needed
+  - Logic:
+    a. Formats descriptions as JSONL
+    b. Truncates to fit token limits
+    c. Builds prompt from template
+    d. Calls LLM via use_llm_func_with_cache
+    e. Returns the summary string
+  - Returns: summary_string only (no boolean flag)
+
+  Analogy:
+
+  - _handle_entity_relation_summary = Manager (decides strategy, orchestrates work)
+  - _summarize_descriptions = Worker (does the actual LLM call)
+
+  Call flow example:
+
+  _merge_nodes_then_upsert
+    └─> _handle_entity_relation_summary (decides: do we need LLM?)
+          ├─> NO LLM needed: just join with separator → return
+          └─> YES LLM needed:
+                └─> _summarize_descriptions (calls LLM) → return summary
+                └─> (if too large, split and call _summarize_descriptions multiple times)
+
+
+  # Note E: What is map-reduce strategy used in _handle_entity_relation_summary:
+
+  Map-Reduce Strategy Explained
+
+  When you have too many descriptions to fit in one LLM call (token limit exceeded), you need to break them down:
+
+  Without Map-Reduce (doesn't work):
+
+  100 descriptions (10,000 tokens total)
+  └─> LLM can only handle 4,000 tokens → FAILS ❌
+
+  With Map-Reduce (works):
+
+  1. MAP Phase (split into chunks):
+
+  100 descriptions (10,000 tokens total)
+  ├─> Chunk 1: descriptions 1-25  (2,500 tokens)
+  ├─> Chunk 2: descriptions 26-50 (2,500 tokens)
+  ├─> Chunk 3: descriptions 51-75 (2,500 tokens)
+  └─> Chunk 4: descriptions 76-100 (2,500 tokens)
+
+  2. REDUCE Phase (summarize each chunk):
+
+  Chunk 1 → _summarize_descriptions → Summary 1
+  Chunk 2 → _summarize_descriptions → Summary 2
+  Chunk 3 → _summarize_descriptions → Summary 3
+  Chunk 4 → _summarize_descriptions → Summary 4
+
+  3. ITERATE (if still too large, repeat):
+
+  Now we have 4 summaries instead of 100 descriptions
+  ├─> If 4 summaries still > token limit: repeat map-reduce
+  └─> If 4 summaries fit: final _summarize_descriptions → Final Summary ✓
+
+  Real Example:
+
+  Entity "Alice" has 50 descriptions from different documents:
+  Iteration 1 (MAP):
+    50 descriptions → split into 5 chunks of 10 descriptions each
+
+  Iteration 1 (REDUCE):
+    Chunk 1 → Summary 1
+    Chunk 2 → Summary 2
+    Chunk 3 → Summary 3
+    Chunk 4 → Summary 4
+    Chunk 5 → Summary 5
+
+  Iteration 2 (check):
+    5 summaries → fits in token limit ✓
+
+  Final REDUCE:
+    5 summaries → _summarize_descriptions → Final Summary
+
+  Why "Map-Reduce"?
+
+  The term comes from distributed computing:
+  - Map: Transform many items → many results (split 100 descriptions → 4 chunks)
+  - Reduce: Combine many results → fewer results (4 chunks → 4 summaries → 1 final summary)
+
+  This is done iteratively until we get one final summary that fits within token limits.
+
+  # Note F: What is record_attributes in _handle_single_entity_extraction?
+
+  What is record_attributes?
+
+  It's the raw LLM output split by delimiter, representing ONE entity record.
+
+  Example:
+
+  LLM outputs this text:
+  entity<|#|>Alice<|#|>PERSON<|#|>A software engineer who works at Google
+
+  After splitting by <|#|>:
+  record_attributes = [
+      "entity",           # [0] - record type
+      "Alice",            # [1] - entity name (raw, needs sanitization)
+      "PERSON",           # [2] - entity type (raw, needs sanitization)
+      "A software engineer who works at Google"  # [3] - description (raw)
+  ]
+
+  This function processes record_attributes to produce:
+  {
+      "entity_name": "Alice",           # sanitized
+      "entity_type": "person",          # sanitized, lowercased
+      "description": "A software engineer who works at Google",
+      "source_id": chunk_key,
+      "file_path": file_path,
+      "timestamp": timestamp
+  }
+
+  So the flow is:
+
+  LLM raw text → split by delimiter → record_attributes (list of strings)
+                                      ↓
+                       _handle_single_entity_extraction (validates & sanitizes)
+                                      ↓
+                                  entity_data (dict)

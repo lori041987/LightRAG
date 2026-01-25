@@ -13,6 +13,7 @@ from lightrag.utils import (
     write_json,
     get_pinyin_sort_key,
 )
+from lightrag.wnc import wnc_log
 from lightrag.exceptions import StorageNotInitializedError
 from .shared_storage import (
     get_namespace_data,
@@ -159,6 +160,27 @@ class JsonDocStatusStorage(DocStatusStorage):
         return result
 
     async def index_done_callback(self) -> None:
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Flushes in-memory document status storage to disk by writing entire _data dict to JSON file (COMMIT operation), with optional data sanitization and reload",
+            inputs={
+                "namespace": self.namespace,
+                "workspace": self.workspace,
+                "file_name": self._file_name,
+                "storage_updated": self.storage_updated.value,
+            },
+            outputs=None,
+            side_effects="Reads storage_updated flag to check if upsert() was called since last flush.\n"
+                        "Writes entire _data dict to disk via write_json (DISK I/O: kv_store_doc_status.json).\n"
+                        "May reload sanitized data from file via load_json if write_json returns needs_reload=True.\n"
+                        "Clears all update flags via clear_all_update_flags to notify other processes.",
+            note="Called by _insert_done after document processing completes (lightrag/lightrag.py:2467-2545).\n"
+                 "This is the COMMIT point - all prior upsert() calls are flushed to disk here.\n"
+                 "Only writes to disk if storage_updated.value is True (upsert() was called since last flush).\n"
+                 "Contrast with upsert(): index_done_callback does DISK I/O, upsert only modifies in-memory _data.",
+            level="info",
+        )
+
         async with self._storage_lock:
             if self.storage_updated.value:
                 data_dict = (
@@ -183,28 +205,107 @@ class JsonDocStatusStorage(DocStatusStorage):
 
                 await clear_all_update_flags(self.namespace, workspace=self.workspace)
 
+                # [WNC] Output log for successful persistence
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback completed - data persisted",
+                    outputs={
+                        "persisted": True,
+                        "namespace": self.namespace,
+                        "file_name": self._file_name,
+                        "data_count": len(data_dict),
+                        "needs_reload": needs_reload,
+                    },
+                    level="info",
+                )
+            else:
+                # [WNC] Output log for no persistence needed
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback - no update needed",
+                    outputs={
+                        "persisted": False,
+                        "reason": "storage_updated is False",
+                        "namespace": self.namespace,
+                    },
+                    level="info",
+                )
+
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """
         Importance notes for in-memory storage:
         1. Changes will be persisted to disk during the next index_done_callback
         2. update flags to notify other processes that data persistence is needed
         """
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Updates in-memory doc status _data dict with document processing status records (INSERT/UPDATE operation), ensuring chunks_list field exists, then immediately flushes to disk via index_done_callback",
+            inputs={
+                "data": data,
+                "data count": len(data) if data else 0,
+                "namespace": self.namespace,
+                "workspace": self.workspace,
+            },
+            outputs=None,
+            side_effects="Updates in-memory shared dict _data (MEMORY ONLY initially).\n"
+                        "Immediately calls index_done_callback to flush to disk (DISK I/O: kv_store_doc_status.json).\n"
+                        "Sets update flags via set_all_update_flags to notify index_done_callback that flush is needed.\n"
+                        "Ensures chunks_list field exists for all documents (initialized to empty list if missing).",
+            note="Called when document status changes (e.g., enqueue, processing, completed, failed).\n"
+                 "Returns early if data is empty.\n"
+                 "Raises StorageNotInitializedError if _storage_lock is None.\n"
+                 "IMPORTANT: Unlike JsonKVStorage.upsert, this immediately calls index_done_callback for persistence.\n"
+                 "This ensures document status is persisted immediately, not batched.",
+            level="info",
+        )
+
         if not data:
+            # [WNC] Output log for early return
+            wnc_log(
+                purpose="[OUTPUT] upsert early return - empty data",
+                outputs={"updated": False, "reason": "data is empty"},
+                level="info",
+            )
             return
+
         logger.debug(
             f"[{self.workspace}] Inserting {len(data)} records to {self.namespace}"
         )
         if self._storage_lock is None:
             raise StorageNotInitializedError("JsonDocStatusStorage")
         async with self._storage_lock:
+            # [WNC] Track new vs updated doc IDs
+            new_doc_ids = []
+            updated_doc_ids = []
+
             # Ensure chunks_list field exists for new documents
             for doc_id, doc_data in data.items():
                 if "chunks_list" not in doc_data:
                     doc_data["chunks_list"] = []
+
+                # [WNC] Track whether this is new or update
+                if doc_id in self._data:
+                    updated_doc_ids.append(doc_id)
+                else:
+                    new_doc_ids.append(doc_id)
+
             self._data.update(data)
             await set_all_update_flags(self.namespace, workspace=self.workspace)
 
         await self.index_done_callback()
+
+        # [WNC] Output log for successful upsert
+        wnc_log(
+            purpose="[OUTPUT] upsert completed successfully",
+            outputs={
+                "updated": True,
+                "namespace": self.namespace,
+                "total_records": len(data),
+                "new_doc_ids_count": len(new_doc_ids),
+                "updated_doc_ids_count": len(updated_doc_ids),
+                "new_doc_ids": new_doc_ids,
+                "updated_doc_ids": updated_doc_ids,
+            },
+            level="info",
+        )
 
     async def is_empty(self) -> bool:
         """Check if the storage is empty

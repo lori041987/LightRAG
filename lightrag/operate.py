@@ -214,12 +214,50 @@ async def _handle_entity_relation_summary(
     Returns:
         Tuple of (final_summarized_description_string, llm_was_used_boolean)
     """
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Orchestrates entity/relation description summarization strategy: if small enough, joins with separator (no LLM); if too large, splits into chunks (MAP), summarizes each chunk via _summarize_descriptions (REDUCE), and repeats iteratively until final summary fits token limits",
+        inputs={
+            "description_type": description_type,
+            "entity_or_relation_name": entity_or_relation_name,
+            "description_list": description_list,
+            "description_count": len(description_list),
+            "seperator": seperator,
+            "summary_context_size": global_config.get("summary_context_size"),
+            "summary_max_tokens": global_config.get("summary_max_tokens"),
+            "force_llm_summary_on_merge": global_config.get("force_llm_summary_on_merge"),
+        },
+        outputs=None,
+        side_effects="May call _summarize_descriptions multiple times (which calls LLM via use_llm_func_with_cache).\n"
+                    "Reads/writes to llm_response_cache if provided (kv_store_llm_response_cache.json).",
+        note="Called by _merge_nodes_then_upsert and _merge_edges_then_upsert during entity/relation merging.\n"
+             "This is the ORCHESTRATOR - decides strategy (join vs LLM summarization).\n"
+             "Returns early if description_list is empty (returns '', False).\n"
+             "Returns early if only one description (returns description, False - no LLM used).\n"
+             "If total tokens small enough and count < force_llm_summary_on_merge: joins with separator, no LLM.\n"
+             "Otherwise: iterative map-reduce with LLM summarization via _summarize_descriptions.\n"
+             "Returns tuple: (final_summary_string, llm_was_used_boolean).",
+        level="info",
+    )
+
     # Handle empty input
     if not description_list:
+        # [WNC] Output log for early return (empty list)
+        wnc_log(
+            purpose="[OUTPUT] _handle_entity_relation_summary early return - empty list",
+            outputs={"summary": "", "llm_was_used": False, "reason": "description_list is empty"},
+            level="info",
+        )
         return "", False
 
     # If only one description, return it directly (no need for LLM call)
     if len(description_list) == 1:
+        # [WNC] Output log for early return (single description)
+        wnc_log(
+            purpose="[OUTPUT] _handle_entity_relation_summary early return - single description",
+            outputs={"summary": description_list[0], "llm_was_used": False, "reason": "only one description"},
+            level="info",
+        )
         return description_list[0], False
 
     # Get configuration
@@ -244,6 +282,20 @@ async def _handle_entity_relation_summary(
             ):
                 # no LLM needed, just join the descriptions
                 final_description = seperator.join(current_list)
+
+                # [WNC] Output log for no LLM summarization (joined with separator)
+                wnc_log(
+                    purpose="[OUTPUT] _handle_entity_relation_summary completed - joined without LLM",
+                    outputs={
+                        "summary": final_description if final_description else "",
+                        "llm_was_used": llm_was_used,
+                        "reason": "within token limits and count < force_llm_summary_on_merge",
+                        "description_count": len(current_list),
+                        "total_tokens": total_tokens,
+                    },
+                    level="info",
+                )
+
                 return final_description if final_description else "", llm_was_used
             else:
                 if total_tokens > summary_context_size and len(current_list) <= 2:
@@ -258,6 +310,20 @@ async def _handle_entity_relation_summary(
                     global_config,
                     llm_response_cache,
                 )
+
+                # [WNC] Output log for LLM summarization
+                wnc_log(
+                    purpose="[OUTPUT] _handle_entity_relation_summary completed - LLM summarized",
+                    outputs={
+                        "summary": final_summary,
+                        "llm_was_used": True,
+                        "reason": "needed LLM summarization",
+                        "description_count": len(current_list),
+                        "total_tokens": total_tokens,
+                    },
+                    level="info",
+                )
+
                 return final_summary, True  # LLM was used for final summarization
 
         # Need to split into chunks - Map phase
@@ -338,6 +404,32 @@ async def _summarize_descriptions(
     Returns:
         Summarized description string
     """
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Worker function that actually calls LLM to condense a list of descriptions into one summary, converting descriptions to JSONL format and truncating by token size if needed",
+        inputs={
+            "description_type": description_type,
+            "description_name": description_name,
+            "description_list": description_list,
+            "description_count": len(description_list),
+            "summary_context_size": global_config.get("summary_context_size"),
+            "summary_length_recommended": global_config.get("summary_length_recommended"),
+            "language": global_config["addon_params"].get("language", "English"),
+        },
+        outputs=None,
+        side_effects="Calls LLM via use_llm_func_with_cache (may read/write to llm_response_cache).\n"
+                    "Reads from kv_store_llm_response_cache.json if cache hit.\n"
+                    "Writes to kv_store_llm_response_cache.json if cache miss and caching enabled.",
+        note="Called by _handle_entity_relation_summary (the orchestrator) during REDUCE phase.\n"
+             "This is the WORKER - does the actual LLM call for summarization.\n"
+             "Converts descriptions to JSONL format with {'Description': desc} structure.\n"
+             "Truncates descriptions list to fit within summary_context_size tokens.\n"
+             "Uses PROMPTS['summarize_entity_descriptions'] template.\n"
+             "Warns if resulting summary exceeds embedding_token_limit.\n"
+             "Uses priority=8 for LLM call (higher priority for summary generation).",
+        level="info",
+    )
+
     use_llm_func: callable = global_config["llm_model_func"]
     # Apply higher priority (8) to entity/relation summary tasks
     use_llm_func = partial(use_llm_func, _priority=8)
@@ -399,6 +491,34 @@ async def _summarize_descriptions(
                 f" for {description_type}: {description_name}"
             )
 
+        # [WNC] Output log when embedding limit check is performed
+        wnc_log(
+            purpose="[OUTPUT] _summarize_descriptions completed - with embedding limit check",
+            outputs={
+                "summary": summary,
+                "description_type": description_type,
+                "description_name": description_name,
+                "input_description_count": len(description_list),
+                "summary_token_count": summary_token_count,
+                "embedding_token_limit": embedding_token_limit,
+                "exceeds_embedding_limit": True if summary_token_count > threshold else False,
+            },
+            level="info",
+        )
+    else:
+        # [WNC] Output log when no embedding limit check
+        wnc_log(
+            purpose="[OUTPUT] _summarize_descriptions completed - no embedding limit check",
+            outputs={
+                "summary": summary,
+                "description_type": description_type,
+                "description_name": description_name,
+                "input_description_count": len(description_list),
+                "reason": "embedding_token_limit is None" if embedding_token_limit is None else "summary is empty",
+            },
+            level="info",
+        )
+
     return summary
 
 
@@ -408,12 +528,46 @@ async def _handle_single_entity_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
 ):
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Parses and validates a single raw entity record (split by delimiter from LLM output), sanitizing entity name/type/description and checking field count and content validity",
+        inputs={
+            "record_attributes": record_attributes,
+            "record_attributes_count": len(record_attributes),
+            "chunk_key": chunk_key,
+            "timestamp": timestamp,
+            "file_path": file_path,
+        },
+        outputs=None,
+        side_effects="None (pure parsing and validation function).",
+        note="Called by _process_extraction_result for each entity record in LLM output.\n"
+             "record_attributes is raw LLM output split by tuple_delimiter (e.g., ['entity', 'Alice', 'PERSON', 'description']).\n"
+             "Expects 4 fields: ['entity', entity_name, entity_type, entity_description].\n"
+             "Returns None if validation fails (wrong field count, invalid format, empty after sanitization).\n"
+             "Returns dict with entity_name, entity_type, description, source_id, file_path, timestamp if valid.\n"
+             "Sanitizes text via sanitize_and_normalize_extracted_text.\n"
+             "Entity type is lowercased and spaces removed.",
+        level="info",
+    )
+
     if len(record_attributes) != 4 or "entity" not in record_attributes[0]:
         if len(record_attributes) > 1 and "entity" in record_attributes[0]:
             logger.warning(
                 f"{chunk_key}: LLM output format error; found {len(record_attributes)}/4 feilds on ENTITY `{record_attributes[1]}` @ `{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
             )
             logger.debug(record_attributes)
+
+        # [WNC] Output log for validation failure (wrong field count)
+        wnc_log(
+            purpose="[OUTPUT] _handle_single_entity_extraction - validation failed",
+            outputs={
+                "entity_data": None,
+                "reason": "wrong field count or missing 'entity' keyword",
+                "expected_fields": 4,
+                "actual_fields": len(record_attributes),
+            },
+            level="info",
+        )
         return None
 
     try:
@@ -425,6 +579,17 @@ async def _handle_single_entity_extraction(
         if not entity_name or not entity_name.strip():
             logger.info(
                 f"Empty entity name found after sanitization. Original: '{record_attributes[1]}'"
+            )
+
+            # [WNC] Output log for validation failure (empty entity name)
+            wnc_log(
+                purpose="[OUTPUT] _handle_single_entity_extraction - validation failed",
+                outputs={
+                    "entity_data": None,
+                    "reason": "empty entity name after sanitization",
+                    "original_entity_name": record_attributes[1],
+                },
+                level="info",
             )
             return None
 
@@ -439,6 +604,17 @@ async def _handle_single_entity_extraction(
             logger.warning(
                 f"Entity extraction error: invalid entity type in: {record_attributes}"
             )
+
+            # [WNC] Output log for validation failure (invalid entity type)
+            wnc_log(
+                purpose="[OUTPUT] _handle_single_entity_extraction - validation failed",
+                outputs={
+                    "entity_data": None,
+                    "reason": "invalid entity type (empty or contains invalid characters)",
+                    "entity_type": entity_type,
+                },
+                level="info",
+            )
             return None
 
         # Remove spaces and convert to lowercase
@@ -451,7 +627,35 @@ async def _handle_single_entity_extraction(
             logger.warning(
                 f"Entity extraction error: empty description for entity '{entity_name}' of type '{entity_type}'"
             )
+
+            # [WNC] Output log for validation failure (empty description)
+            wnc_log(
+                purpose="[OUTPUT] _handle_single_entity_extraction - validation failed",
+                outputs={
+                    "entity_data": None,
+                    "reason": "empty description after sanitization",
+                    "entity_name": entity_name,
+                    "entity_type": entity_type,
+                },
+                level="info",
+            )
             return None
+
+        # [WNC] Output log for successful extraction
+        wnc_log(
+            purpose="[OUTPUT] _handle_single_entity_extraction - success",
+            outputs={
+                "entity_data": {
+                    "entity_name": entity_name,
+                    "entity_type": entity_type,
+                    "description": entity_description,
+                    "source_id": chunk_key,
+                    "file_path": file_path,
+                    "timestamp": timestamp,
+                },
+            },
+            level="info",
+        )
 
         return dict(
             entity_name=entity_name,
@@ -466,10 +670,34 @@ async def _handle_single_entity_extraction(
         logger.error(
             f"Entity extraction failed due to encoding issues in chunk {chunk_key}: {e}"
         )
+
+        # [WNC] Output log for exception (ValueError)
+        wnc_log(
+            purpose="[OUTPUT] _handle_single_entity_extraction - exception",
+            outputs={
+                "entity_data": None,
+                "reason": "ValueError - encoding issues",
+                "error": str(e),
+                "chunk_key": chunk_key,
+            },
+            level="info",
+        )
         return None
     except Exception as e:
         logger.error(
             f"Entity extraction failed with unexpected error in chunk {chunk_key}: {e}"
+        )
+
+        # [WNC] Output log for exception (unexpected)
+        wnc_log(
+            purpose="[OUTPUT] _handle_single_entity_extraction - exception",
+            outputs={
+                "entity_data": None,
+                "reason": "unexpected exception",
+                "error": str(e),
+                "chunk_key": chunk_key,
+            },
+            level="info",
         )
         return None
 
@@ -480,6 +708,28 @@ async def _handle_single_relationship_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
 ):
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Parses and validates a single raw relationship record (split by delimiter from LLM output), sanitizing source/target/keywords/description and checking field count and content validity",
+        inputs={
+            "record_attributes": record_attributes,
+            "record_attributes_count": len(record_attributes),
+            "chunk_key": chunk_key,
+            "timestamp": timestamp,
+            "file_path": file_path,
+        },
+        outputs=None,
+        side_effects="None (pure parsing and validation function).",
+        note="Called by _process_extraction_result for each relationship record in LLM output.\n"
+             "record_attributes is raw LLM output split by tuple_delimiter (e.g., ['relation', 'Alice', 'Bob', 'knows', 'description']).\n"
+             "Expects 5 fields: ['relation', source_entity, target_entity, keywords, description].\n"
+             "Returns None if validation fails (wrong field count, empty entities, source==target).\n"
+             "Returns dict with src_id, tgt_id, weight, description, keywords, source_id, file_path, timestamp if valid.\n"
+             "Sanitizes text via sanitize_and_normalize_extracted_text.\n"
+             "Replaces Chinese comma with English comma in keywords.",
+        level="info",
+    )
+
     if (
         len(record_attributes) != 5 or "relation" not in record_attributes[0]
     ):  # treat "relationship" and "relation" interchangeable
@@ -488,6 +738,18 @@ async def _handle_single_relationship_extraction(
                 f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
             )
             logger.debug(record_attributes)
+
+        # [WNC] Output log for validation failure (wrong field count)
+        wnc_log(
+            purpose="[OUTPUT] _handle_single_relationship_extraction - validation failed",
+            outputs={
+                "relationship_data": None,
+                "reason": "wrong field count or missing 'relation' keyword",
+                "expected_fields": 5,
+                "actual_fields": len(record_attributes),
+            },
+            level="info",
+        )
         return None
 
     try:
@@ -503,17 +765,50 @@ async def _handle_single_relationship_extraction(
             logger.info(
                 f"Empty source entity found after sanitization. Original: '{record_attributes[1]}'"
             )
+
+            # [WNC] Output log for validation failure (empty source)
+            wnc_log(
+                purpose="[OUTPUT] _handle_single_relationship_extraction - validation failed",
+                outputs={
+                    "relationship_data": None,
+                    "reason": "empty source entity after sanitization",
+                    "original_source": record_attributes[1],
+                },
+                level="info",
+            )
             return None
 
         if not target:
             logger.info(
                 f"Empty target entity found after sanitization. Original: '{record_attributes[2]}'"
             )
+
+            # [WNC] Output log for validation failure (empty target)
+            wnc_log(
+                purpose="[OUTPUT] _handle_single_relationship_extraction - validation failed",
+                outputs={
+                    "relationship_data": None,
+                    "reason": "empty target entity after sanitization",
+                    "original_target": record_attributes[2],
+                },
+                level="info",
+            )
             return None
 
         if source == target:
             logger.debug(
                 f"Relationship source and target are the same in: {record_attributes}"
+            )
+
+            # [WNC] Output log for validation failure (self-loop)
+            wnc_log(
+                purpose="[OUTPUT] _handle_single_relationship_extraction - validation failed",
+                outputs={
+                    "relationship_data": None,
+                    "reason": "source and target are the same (self-loop)",
+                    "entity": source,
+                },
+                level="info",
             )
             return None
 
@@ -533,6 +828,24 @@ async def _handle_single_relationship_extraction(
             else 1.0
         )
 
+        # [WNC] Output log for successful extraction
+        wnc_log(
+            purpose="[OUTPUT] _handle_single_relationship_extraction - success",
+            outputs={
+                "relationship_data": {
+                    "src_id": source,
+                    "tgt_id": target,
+                    "weight": weight,
+                    "description": edge_description,
+                    "keywords": edge_keywords,
+                    "source_id": edge_source_id,
+                    "file_path": file_path,
+                    "timestamp": timestamp,
+                },
+            },
+            level="info",
+        )
+
         return dict(
             src_id=source,
             tgt_id=target,
@@ -548,10 +861,34 @@ async def _handle_single_relationship_extraction(
         logger.warning(
             f"Relationship extraction failed due to encoding issues in chunk {chunk_key}: {e}"
         )
+
+        # [WNC] Output log for exception (ValueError)
+        wnc_log(
+            purpose="[OUTPUT] _handle_single_relationship_extraction - exception",
+            outputs={
+                "relationship_data": None,
+                "reason": "ValueError - encoding issues",
+                "error": str(e),
+                "chunk_key": chunk_key,
+            },
+            level="info",
+        )
         return None
     except Exception as e:
         logger.warning(
             f"Relationship extraction failed with unexpected error in chunk {chunk_key}: {e}"
+        )
+
+        # [WNC] Output log for exception (unexpected)
+        wnc_log(
+            purpose="[OUTPUT] _handle_single_relationship_extraction - exception",
+            outputs={
+                "relationship_data": None,
+                "reason": "unexpected exception",
+                "error": str(e),
+                "chunk_key": chunk_key,
+            },
+            level="info",
         )
         return None
 
@@ -952,6 +1289,31 @@ async def _process_extraction_result(
     Returns:
         tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
     """
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Parses raw LLM extraction result into structured entities and relationships by splitting records, fixing format errors, validating fields, and truncating long entity names",
+        inputs={
+            "result": result,
+            "result length": len(result),
+            "chunk_key": chunk_key,
+            "timestamp": timestamp,
+            "file_path": file_path,
+            "tuple_delimiter": tuple_delimiter,
+            "completion_delimiter": completion_delimiter,
+        },
+        outputs=None,
+        side_effects="None (pure parsing function, no storage writes).\n"
+                    "Calls _handle_single_entity_extraction and _handle_single_relationship_extraction for validation.\n"
+                    "Calls _truncate_entity_identifier to limit entity name lengths to DEFAULT_ENTITY_NAME_MAX_LENGTH.",
+        note="Called by extract_entities for both initial extraction and gleaning iterations.\n"
+             "Handles LLM output format errors: missing completion delimiter, using tuple_delimiter as record separator instead of newline.\n"
+             "Fixes tuple_delimiter corruption patterns in LLM output (e.g., missing pipes, case changes).\n"
+             "Entity names and relation entity IDs are truncated to DEFAULT_ENTITY_NAME_MAX_LENGTH.\n"
+             "Returns two dicts: nodes_dict keyed by entity_name, edges_dict keyed by (src_id, tgt_id) tuples.\n"
+             "Each dict value is a list allowing multiple extractions for same entity/relation from different parts of the result.",
+        level="info",
+    )
+
     maybe_nodes = defaultdict(list)
     maybe_edges = defaultdict(list)
 
@@ -1054,6 +1416,21 @@ async def _process_extraction_result(
             relationship_data["src_id"] = truncated_source
             relationship_data["tgt_id"] = truncated_target
             maybe_edges[(truncated_source, truncated_target)].append(relationship_data)
+
+    # [WNC] Output log at function completion
+    wnc_log(
+        purpose="[OUTPUT] _process_extraction_result completed",
+        outputs={
+            "chunk_key": chunk_key,
+            "entities count": len(maybe_nodes),
+            "relationships count": len(maybe_edges),
+            "total entity extractions": sum(len(v) for v in maybe_nodes.values()),
+            "total relationship extractions": sum(len(v) for v in maybe_edges.values()),
+            "entities": list(maybe_nodes.keys()),
+            "relationships": list(maybe_edges.keys()),
+        },
+        level="info",
+    )
 
     return dict(maybe_nodes), dict(maybe_edges)
 
@@ -2784,11 +3161,44 @@ async def merge_nodes_and_edges(
         pipeline_status["history_messages"].append(log_message)
 
     async def _locked_process_entity_name(entity_name, entities):
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Acquires entity-specific lock and calls _merge_nodes_then_upsert to process a single entity across all chunks",
+            inputs={
+                "entity_name": entity_name,
+                "entities count": len(entities),
+                "workspace": global_config.get("workspace", ""),
+                "semaphore limit": graph_max_async,
+            },
+            outputs=None,
+            side_effects="Acquires semaphore slot and entity-specific lock.\n"
+                        "Calls _merge_nodes_then_upsert which writes to knowledge graph, entity vector database, and entity chunks storage.\n"
+                        "Updates pipeline_status on error.\n"
+                        "May raise PipelineCancelledException if cancellation is requested.",
+            note="Nested helper function inside merge_nodes_and_edges.\n"
+                 "Runs during 'Phase 1: Process all entities concurrently' - this phase processes all entities before Phase 2 (relationships) and Phase 3 (document-level storage updates).\n"
+                 "Multiple instances of this function run concurrently, one per entity name, controlled by semaphore.\n"
+                 "Acquires entity-specific lock via get_storage_keyed_lock to prevent concurrent writes to same entity.\n"
+                 "Checks for cancellation before processing.\n"
+                 "On error, updates pipeline_status and re-raises exception with entity name prefix.",
+            level="info",
+        )
+
         async with semaphore:
             # Check for cancellation before processing entity
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     if pipeline_status.get("cancellation_requested", False):
+                        # [WNC] Output log for early return (cancellation)
+                        wnc_log(
+                            purpose="[OUTPUT] _locked_process_entity_name early return - cancelled",
+                            outputs={
+                                "entity_name": entity_name,
+                                "status": "cancelled",
+                                "reason": "User requested cancellation during entity merge",
+                            },
+                            level="info",
+                        )
                         raise PipelineCancelledException(
                             "User cancelled during entity merge"
                         )
@@ -2810,6 +3220,17 @@ async def merge_nodes_and_edges(
                         pipeline_status_lock,
                         llm_response_cache,
                         entity_chunks_storage,
+                    )
+
+                    # [WNC] Output log for successful completion
+                    wnc_log(
+                        purpose="[OUTPUT] _locked_process_entity_name success",
+                        outputs={
+                            "entity_name": entity_name,
+                            "status": "success",
+                            "entity_data": entity_data,
+                        },
+                        level="info",
                     )
 
                     return entity_data
@@ -2885,11 +3306,46 @@ async def merge_nodes_and_edges(
         pipeline_status["history_messages"].append(log_message)
 
     async def _locked_process_edges(edge_key, edges):
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Acquires relationship-specific lock and calls _merge_edges_then_upsert to process a single relationship across all chunks",
+            inputs={
+                "edge_key": edge_key,
+                "edges count": len(edges),
+                "workspace": global_config.get("workspace", ""),
+                "semaphore limit": graph_max_async,
+            },
+            outputs=None,
+            side_effects="Acquires semaphore slot and relationship-specific lock.\n"
+                        "Calls _merge_edges_then_upsert which writes to knowledge graph, relationship vector database, and relation chunks storage.\n"
+                        "May add missing entities to entity vector database if relationship references non-existent entities.\n"
+                        "Updates pipeline_status on error.\n"
+                        "May raise PipelineCancelledException if cancellation is requested.",
+            note="Nested helper function inside merge_nodes_and_edges.\n"
+                 "Runs during 'Phase 2: Process all relationships concurrently' - this phase runs after Phase 1 (entities) and before Phase 3 (document-level storage updates).\n"
+                 "Multiple instances of this function run concurrently, one per relationship pair, controlled by semaphore.\n"
+                 "Acquires relationship-specific lock via get_storage_keyed_lock using sorted edge key to prevent concurrent writes to same relationship.\n"
+                 "Checks for cancellation before processing.\n"
+                 "Tracks added_entities list to collect any entities created during relationship processing (when relationship references missing entities).\n"
+                 "On error, updates pipeline_status and re-raises exception with edge key prefix.",
+            level="info",
+        )
+
         async with semaphore:
             # Check for cancellation before processing edges
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     if pipeline_status.get("cancellation_requested", False):
+                        # [WNC] Output log for early return (cancellation)
+                        wnc_log(
+                            purpose="[OUTPUT] _locked_process_edges early return - cancelled",
+                            outputs={
+                                "edge_key": edge_key,
+                                "status": "cancelled",
+                                "reason": "User requested cancellation during relation merge",
+                            },
+                            level="info",
+                        )
                         raise PipelineCancelledException(
                             "User cancelled during relation merge"
                         )
@@ -2924,7 +3380,34 @@ async def merge_nodes_and_edges(
                     )
 
                     if edge_data is None:
+                        # [WNC] Output log for early return (None edge_data)
+                        wnc_log(
+                            purpose="[OUTPUT] _locked_process_edges early return - edge_data is None",
+                            outputs={
+                                "edge_key": edge_key,
+                                "sorted_edge_key": sorted_edge_key,
+                                "status": "skipped",
+                                "reason": "_merge_edges_then_upsert returned None",
+                                "edge_data": None,
+                                "added_entities": [],
+                            },
+                            level="info",
+                        )
                         return None, []
+
+                    # [WNC] Output log for successful completion
+                    wnc_log(
+                        purpose="[OUTPUT] _locked_process_edges success",
+                        outputs={
+                            "edge_key": edge_key,
+                            "sorted_edge_key": sorted_edge_key,
+                            "status": "success",
+                            "edge_data": edge_data,
+                            "added_entities count": len(added_entities),
+                            "added_entities": added_entities if added_entities else [],
+                        },
+                        level="info",
+                    )
 
                     return edge_data, added_entities
 
@@ -3165,6 +3648,31 @@ async def extract_entities(
         # Get file path from chunk data or use default
         file_path = chunk_dp.get("file_path", "unknown_source")
 
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Calls LLM for entity extraction on a single chunk, optionally does gleaning pass, merges results, and updates chunk's cache list",
+            inputs={
+                "chunk_key": chunk_key,
+                "chunk_dp": chunk_dp,
+                "file_path": file_path,
+                "content": content,
+                "entity_extract_max_gleaning": entity_extract_max_gleaning,
+            },
+            outputs=None,
+            side_effects="Calls use_llm_func_with_cache which may write to llm_response_cache.\n"
+                        "Calls update_chunk_cache_list which writes to text_chunks_storage.\n"
+                        "Updates pipeline_status with progress message.\n"
+                        "Increments nonlocal processed_chunks counter.",
+            note="Nested helper function inside extract_entities.\n"
+                 "Runs concurrently with other chunk processing tasks, controlled by semaphore.\n"
+                 "Makes 1 or 2 LLM calls depending on entity_extract_max_gleaning setting:\n"
+                 "  - Always makes initial extraction call\n"
+                 "  - If entity_extract_max_gleaning > 0, makes additional 'continue extraction' gleaning call\n"
+                 "When gleaning is enabled, merges gleaning results with initial results (keeps better description based on length).\n"
+                 "Batch updates chunk's llm_cache_list at the end with all collected cache keys.",
+            level="info",
+        )
+
         # Create cache keys collector for batch processing
         cache_keys_collector = []
 
@@ -3277,6 +3785,24 @@ async def extract_entities(
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
+
+        # [WNC] Output log for successful completion
+        wnc_log(
+            purpose="[OUTPUT] _process_single_content success",
+            outputs={
+                "chunk_key": chunk_key,
+                "file_path": file_path,
+                "status": "success",
+                "entities count": entities_count,
+                "relations count": relations_count,
+                "maybe_nodes": maybe_nodes,
+                "maybe_edges": maybe_edges,
+                "processed_chunks": processed_chunks,
+                "total_chunks": total_chunks,
+                "cache_keys_collected": len(cache_keys_collector),
+            },
+            level="info",
+        )
 
         # Return the extracted nodes and edges for centralized processing
         return maybe_nodes, maybe_edges

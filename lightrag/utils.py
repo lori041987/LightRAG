@@ -1436,14 +1436,55 @@ async def handle_cache(
     Returns:
         tuple[str, int] | None: (content, create_time) if cache hit, None if cache miss
     """
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Checks LLM response cache for existing result matching args_hash, returns cached content if found, otherwise returns None for cache miss",
+        inputs={
+            "args_hash": args_hash,
+            "prompt": prompt,
+            "mode": mode,
+            "cache_type": cache_type,
+            "hashing_kv": "provided" if hashing_kv else "None",
+            "enable_llm_cache": hashing_kv.global_config.get("enable_llm_cache") if hashing_kv else "N/A",
+            "enable_llm_cache_for_entity_extract": hashing_kv.global_config.get("enable_llm_cache_for_entity_extract") if hashing_kv else "N/A",
+        },
+        outputs=None,
+        side_effects="Reads from llm_response_cache via hashing_kv.get_by_id (kv_store_llm_response_cache.json).\n"
+                    "No writes - this is a read-only cache lookup function.",
+        note="Called by use_llm_func_with_cache to check cache before LLM call.\n"
+             "Returns None in three cases: hashing_kv is None, cache disabled by config, cache miss.\n"
+             "Cache key format: {mode}:{cache_type}:{args_hash} (e.g., 'default:extract:abc123').\n"
+             "For mode='default' (entity extraction), checks enable_llm_cache_for_entity_extract.\n"
+             "For mode!='default' (queries), checks enable_llm_cache.",
+        level="info",
+    )
+
     if hashing_kv is None:
+        # [WNC] Output log for early return (no hashing_kv)
+        wnc_log(
+            purpose="[OUTPUT] handle_cache early return - no hashing_kv",
+            outputs={"result": None, "reason": "hashing_kv is None"},
+            level="info",
+        )
         return None
 
     if mode != "default":  # handle cache for all type of query
         if not hashing_kv.global_config.get("enable_llm_cache"):
+            # [WNC] Output log for early return (cache disabled for queries)
+            wnc_log(
+                purpose="[OUTPUT] handle_cache early return - cache disabled for queries",
+                outputs={"result": None, "reason": "enable_llm_cache is False", "mode": mode},
+                level="info",
+            )
             return None
     else:  # handle cache for entity extraction
         if not hashing_kv.global_config.get("enable_llm_cache_for_entity_extract"):
+            # [WNC] Output log for early return (cache disabled for entity extraction)
+            wnc_log(
+                purpose="[OUTPUT] handle_cache early return - cache disabled for entity extraction",
+                outputs={"result": None, "reason": "enable_llm_cache_for_entity_extract is False", "mode": mode},
+                level="info",
+            )
             return None
 
     # Use flattened cache key format: {mode}:{cache_type}:{hash}
@@ -1453,9 +1494,35 @@ async def handle_cache(
         logger.debug(f"Flattened cache hit(key:{flattened_key})")
         content = cache_entry["return"]
         timestamp = cache_entry.get("create_time", 0)
+
+        # [WNC] Output log for cache hit
+        wnc_log(
+            purpose="[OUTPUT] handle_cache - cache hit",
+            outputs={
+                "cache_hit": True,
+                "flattened_key": flattened_key,
+                "content": content,
+                "timestamp": timestamp,
+            },
+            level="info",
+        )
+
         return content, timestamp
 
     logger.debug(f"Cache missed(mode:{mode} type:{cache_type})")
+
+    # [WNC] Output log for cache miss
+    wnc_log(
+        purpose="[OUTPUT] handle_cache - cache miss",
+        outputs={
+            "cache_hit": False,
+            "flattened_key": flattened_key,
+            "mode": mode,
+            "cache_type": cache_type,
+        },
+        level="info",
+    )
+
     return None
 
 
@@ -1477,13 +1544,51 @@ async def save_to_cache(hashing_kv, cache_data: CacheData):
         hashing_kv: The key-value storage for caching
         cache_data: The cache data to save
     """
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Saves LLM response to cache storage using flattened key format, skipping if storage is None, content is empty, content is streaming, or identical content already cached",
+        inputs={
+            "args_hash": cache_data.args_hash,
+            "content": cache_data.content,
+            "prompt": cache_data.prompt,
+            "mode": cache_data.mode,
+            "cache_type": cache_data.cache_type,
+            "chunk_id": cache_data.chunk_id if cache_data.chunk_id else "None",
+            "queryparam": cache_data.queryparam if cache_data.queryparam else "None",
+            "hashing_kv": "provided" if hashing_kv else "None",
+        },
+        outputs=None,
+        side_effects="Writes to llm_response_cache via hashing_kv.upsert (kv_store_llm_response_cache.json).\n"
+                    "Reads existing cache via hashing_kv.get_by_id to check for duplication before writing.",
+        note="Called by use_llm_func_with_cache after LLM call completes (cache miss scenario).\n"
+             "Cache key format: {mode}:{cache_type}:{args_hash} (e.g., 'default:extract:abc123').\n"
+             "Skips caching if: hashing_kv is None, content is empty, content is streaming (__aiter__), or identical content already exists.\n"
+             "Cache entry includes: return (content), cache_type, chunk_id, original_prompt, queryparam, create_time (auto-added by storage).",
+        level="info",
+    )
+
     # Skip if storage is None or content is a streaming response
     if hashing_kv is None or not cache_data.content:
+        # [WNC] Output log for early return (no storage or empty content)
+        wnc_log(
+            purpose="[OUTPUT] save_to_cache early return - no storage or empty content",
+            outputs={
+                "saved": False,
+                "reason": "hashing_kv is None" if hashing_kv is None else "content is empty",
+            },
+            level="info",
+        )
         return
 
     # If content is a streaming response, don't cache it
     if hasattr(cache_data.content, "__aiter__"):
         logger.debug("Streaming response detected, skipping cache")
+        # [WNC] Output log for early return (streaming response)
+        wnc_log(
+            purpose="[OUTPUT] save_to_cache early return - streaming response",
+            outputs={"saved": False, "reason": "content is streaming response"},
+            level="info",
+        )
         return
 
     # Use flattened cache key format: {mode}:{cache_type}:{hash}
@@ -1498,6 +1603,16 @@ async def save_to_cache(hashing_kv, cache_data: CacheData):
         if existing_content == cache_data.content:
             logger.warning(
                 f"Cache duplication detected for {flattened_key}, skipping update"
+            )
+            # [WNC] Output log for early return (duplicate content)
+            wnc_log(
+                purpose="[OUTPUT] save_to_cache early return - duplicate content",
+                outputs={
+                    "saved": False,
+                    "reason": "identical content already cached",
+                    "flattened_key": flattened_key,
+                },
+                level="info",
             )
             return
 
@@ -1516,6 +1631,19 @@ async def save_to_cache(hashing_kv, cache_data: CacheData):
 
     # Save using flattened key
     await hashing_kv.upsert({flattened_key: cache_entry})
+
+    # [WNC] Output log for successful save
+    wnc_log(
+        purpose="[OUTPUT] save_to_cache completed successfully",
+        outputs={
+            "saved": True,
+            "flattened_key": flattened_key,
+            "cache_type": cache_data.cache_type,
+            "mode": cache_data.mode,
+            "chunk_id": cache_data.chunk_id,
+        },
+        level="info",
+    )
 
 
 def safe_unicode_decode(content):
@@ -1949,7 +2077,35 @@ async def update_chunk_cache_list(
         cache_keys: List of cache keys to add to the list
         cache_scenario: Description of the cache scenario for logging
     """
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Updates chunk's llm_cache_list field by adding new cache keys to track which LLM cache entries are associated with this chunk",
+        inputs={
+            "chunk_id": chunk_id,
+            "cache_keys": cache_keys,
+            "cache_keys count": len(cache_keys) if cache_keys else 0,
+            "cache_scenario": cache_scenario,
+            "text_chunks_storage": "provided" if text_chunks_storage else "None",
+        },
+        outputs=None,
+        side_effects="Reads chunk data from text_chunks_storage via get_by_id.\n"
+                    "Writes updated chunk data to text_chunks_storage via upsert (kv_store_text_chunks.json).\n"
+                    "Only writes if there are new cache keys not already in llm_cache_list.",
+        note="Called after LLM calls to maintain bidirectional relationship between chunks and cache entries.\n"
+             "Deduplicates cache keys - only adds keys not already in llm_cache_list.\n"
+             "Creates llm_cache_list field if it doesn't exist in chunk data.\n"
+             "Returns early if cache_keys is empty or None.\n"
+             "Logs warning and continues on exception (non-critical operation).",
+        level="info",
+    )
+
     if not cache_keys:
+        # [WNC] Output log for early return (no cache keys)
+        wnc_log(
+            purpose="[OUTPUT] update_chunk_cache_list early return - no cache keys",
+            outputs={"updated": False, "reason": "cache_keys is empty"},
+            level="info",
+        )
         return
 
     try:
@@ -1971,9 +2127,58 @@ async def update_chunk_cache_list(
                 logger.debug(
                     f"Updated chunk {chunk_id} with {len(new_keys)} cache keys ({cache_scenario})"
                 )
+
+                # [WNC] Output log for successful update
+                wnc_log(
+                    purpose="[OUTPUT] update_chunk_cache_list completed successfully",
+                    outputs={
+                        "updated": True,
+                        "chunk_id": chunk_id,
+                        "new_keys_added": len(new_keys),
+                        "total_cache_keys": len(chunk_data["llm_cache_list"]),
+                        "cache_scenario": cache_scenario,
+                    },
+                    level="info",
+                )
+            else:
+                # [WNC] Output log for no update needed
+                wnc_log(
+                    purpose="[OUTPUT] update_chunk_cache_list - no new keys",
+                    outputs={
+                        "updated": False,
+                        "reason": "all cache keys already in llm_cache_list",
+                        "chunk_id": chunk_id,
+                        "existing_keys_count": len(existing_keys),
+                    },
+                    level="info",
+                )
+        else:
+            # [WNC] Output log for chunk not found
+            wnc_log(
+                purpose="[OUTPUT] update_chunk_cache_list - chunk not found",
+                outputs={
+                    "updated": False,
+                    "reason": "chunk_id not found in text_chunks_storage",
+                    "chunk_id": chunk_id,
+                },
+                level="info",
+            )
     except Exception as e:
         logger.warning(
             f"Failed to update chunk {chunk_id} with cache references on {cache_scenario}: {e}"
+        )
+
+        # [WNC] Output log for exception
+        wnc_log(
+            purpose="[OUTPUT] update_chunk_cache_list - exception occurred",
+            outputs={
+                "updated": False,
+                "reason": "exception during update",
+                "chunk_id": chunk_id,
+                "error": str(e),
+                "cache_scenario": cache_scenario,
+            },
+            level="info",
         )
 
 

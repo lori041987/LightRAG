@@ -5,6 +5,7 @@ from typing import final
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from lightrag.utils import logger
 from lightrag.base import BaseGraphStorage
+from lightrag.wnc import wnc_log
 import networkx as nx
 from .shared_storage import (
     get_namespace_lock,
@@ -502,6 +503,28 @@ class NetworkXStorage(BaseGraphStorage):
 
     async def index_done_callback(self) -> bool:
         """Save data to disk"""
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Flushes in-memory NetworkX graph to disk by writing to GraphML XML file (COMMIT operation), or reloads from disk if another process updated storage",
+            inputs={
+                "namespace": self.namespace,
+                "workspace": self.workspace,
+                "graphml_xml_file": self._graphml_xml_file,
+                "storage_updated": self.storage_updated.value,
+            },
+            outputs=None,
+            side_effects="Reads storage_updated flag to check if another process modified storage.\n"
+                        "If another process updated: reloads _graph from disk via load_nx_graph (DISK I/O read from GraphML).\n"
+                        "If no conflict: writes _graph to disk via write_nx_graph (DISK I/O write: graph_chunk_entity_relation.graphml).\n"
+                        "Sets update flags via set_all_update_flags to notify other processes.",
+            note="Called by _insert_done after document processing completes (lightrag/lightrag.py:2467-2545).\n"
+                 "This is the COMMIT point - all prior graph modifications (upsert_node, upsert_edge) are flushed to disk here.\n"
+                 "Returns False if storage was updated by another process (conflict detected).\n"
+                 "Returns True on successful save.\n"
+                 "Contrast with upsert operations: index_done_callback does DISK I/O, upsert only modifies in-memory _graph.",
+            level="info",
+        )
+
         async with self._storage_lock:
             # Check if storage was updated by another process
             if self.storage_updated.value:
@@ -514,6 +537,20 @@ class NetworkXStorage(BaseGraphStorage):
                 )
                 # Reset update flag
                 self.storage_updated.value = False
+
+                # [WNC] Output log for conflict/reload
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback - conflict detected, reloaded from disk",
+                    outputs={
+                        "persisted": False,
+                        "reloaded": True,
+                        "reason": "storage_updated by another process",
+                        "namespace": self.namespace,
+                        "file_name": self._graphml_xml_file,
+                    },
+                    level="info",
+                )
+
                 return False  # Return error
 
         # Acquire lock and perform persistence
@@ -527,9 +564,38 @@ class NetworkXStorage(BaseGraphStorage):
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
                 # Reset own update flag to avoid self-reloading
                 self.storage_updated.value = False
+
+                # [WNC] Output log for successful save
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback completed - graph persisted",
+                    outputs={
+                        "persisted": True,
+                        "namespace": self.namespace,
+                        "file_name": self._graphml_xml_file,
+                        "nodes_count": self._graph.number_of_nodes(),
+                        "edges_count": self._graph.number_of_edges(),
+                        "nodes": list(self._graph.nodes()),
+                        "edges": list(self._graph.edges()),
+                    },
+                    level="info",
+                )
+
                 return True  # Return success
             except Exception as e:
                 logger.error(f"[{self.workspace}] Error saving graph: {e}")
+
+                # [WNC] Output log for save error
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback - save error",
+                    outputs={
+                        "persisted": False,
+                        "reason": "exception during save",
+                        "namespace": self.namespace,
+                        "error": str(e),
+                    },
+                    level="info",
+                )
+
                 return False  # Return error
 
         return True

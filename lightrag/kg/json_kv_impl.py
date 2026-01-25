@@ -10,6 +10,7 @@ from lightrag.utils import (
     logger,
     write_json,
 )
+from lightrag.wnc import wnc_log
 from lightrag.exceptions import StorageNotInitializedError
 from .shared_storage import (
     get_namespace_data,
@@ -75,6 +76,28 @@ class JsonKVStorage(BaseKVStorage):
                     )
 
     async def index_done_callback(self) -> None:
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Flushes in-memory KV storage to disk by writing entire _data dict to JSON file (COMMIT operation), with optional data sanitization and reload",
+            inputs={
+                "namespace": self.namespace,
+                "workspace": self.workspace,
+                "file_name": self._file_name,
+                "storage_updated": self.storage_updated.value,
+            },
+            outputs=None,
+            side_effects="Reads storage_updated flag to check if upsert() was called since last flush.\n"
+                        "Writes entire _data dict to disk via write_json (DISK I/O: kv_store_full_docs.json, kv_store_text_chunks.json, etc.).\n"
+                        "May reload sanitized data from file via load_json if write_json returns needs_reload=True.\n"
+                        "Clears all update flags via clear_all_update_flags to notify other processes.",
+            note="Called by _insert_done after document processing completes (lightrag/lightrag.py:2467-2545).\n"
+                 "This is the COMMIT point - all prior upsert() calls are flushed to disk here.\n"
+                 "Only writes to disk if storage_updated.value is True (upsert() was called since last flush).\n"
+                 "Sanitization may occur if data contains invalid JSON types (handled by write_json).\n"
+                 "Contrast with upsert(): index_done_callback does DISK I/O, upsert only modifies in-memory _data.",
+            level="info",
+        )
+
         async with self._storage_lock:
             if self.storage_updated.value:
                 data_dict = (
@@ -102,6 +125,30 @@ class JsonKVStorage(BaseKVStorage):
                         self._data.update(cleaned_data)
 
                 await clear_all_update_flags(self.namespace, workspace=self.workspace)
+
+                # [WNC] Output log for successful persistence
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback completed - data persisted",
+                    outputs={
+                        "persisted": True,
+                        "namespace": self.namespace,
+                        "file_name": self._file_name,
+                        "data_count": data_count,
+                        "needs_reload": needs_reload,
+                    },
+                    level="info",
+                )
+            else:
+                # [WNC] Output log for no persistence needed
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback - no update needed",
+                    outputs={
+                        "persisted": False,
+                        "reason": "storage_updated is False",
+                        "namespace": self.namespace,
+                    },
+                    level="info",
+                )
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         async with self._storage_lock:
@@ -144,7 +191,36 @@ class JsonKVStorage(BaseKVStorage):
         1. Changes will be persisted to disk during the next index_done_callback
         2. update flags to notify other processes that data persistence is needed
         """
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Updates in-memory _data dict with new or modified records (INSERT/UPDATE operation), adding timestamps and setting update flags, NO disk I/O until index_done_callback",
+            inputs={
+                "data": data,
+                "data count": len(data) if data else 0,
+                "namespace": self.namespace,
+                "workspace": self.workspace,
+            },
+            outputs=None,
+            side_effects="Updates in-memory shared dict _data (MEMORY ONLY - no disk I/O).\n"
+                        "Will be persisted to disk later when index_done_callback is called (COMMIT point).\n"
+                        "Sets update flags via set_all_update_flags to notify index_done_callback that flush is needed.\n"
+                        "Adds/updates timestamps: create_time (new records), update_time (all records).\n"
+                        "For text_chunks namespace, ensures llm_cache_list field exists.",
+            note="Called frequently throughout indexing pipeline for various KV stores (full_docs, text_chunks, entities, relations, etc.).\n"
+                 "Returns early if data is empty.\n"
+                 "Raises StorageNotInitializedError if _storage_lock is None.\n"
+                 "Updates are atomic per namespace due to _storage_lock.\n"
+                 "Contrast with index_done_callback: upsert only modifies memory, index_done_callback does DISK I/O flush.",
+            level="info",
+        )
+
         if not data:
+            # [WNC] Output log for early return
+            wnc_log(
+                purpose="[OUTPUT] upsert early return - empty data",
+                outputs={"updated": False, "reason": "data is empty"},
+                level="info",
+            )
             return
 
         import time
@@ -157,6 +233,10 @@ class JsonKVStorage(BaseKVStorage):
         if self._storage_lock is None:
             raise StorageNotInitializedError("JsonKVStorage")
         async with self._storage_lock:
+            # [WNC] Track new vs updated records
+            new_keys = []
+            updated_keys = []
+
             # Add timestamps to data based on whether key exists
             for k, v in data.items():
                 # For text_chunks namespace, ensure llm_cache_list field exists
@@ -167,14 +247,32 @@ class JsonKVStorage(BaseKVStorage):
                 # Add timestamps based on whether key exists
                 if k in self._data:  # Key exists, only update update_time
                     v["update_time"] = current_time
+                    updated_keys.append(k)  # [WNC] Track updated key
                 else:  # New key, set both create_time and update_time
                     v["create_time"] = current_time
                     v["update_time"] = current_time
+                    new_keys.append(k)  # [WNC] Track new key
 
                 v["_id"] = k
 
             self._data.update(data)
             await set_all_update_flags(self.namespace, workspace=self.workspace)
+
+            # [WNC] Output log for successful upsert
+            wnc_log(
+                purpose="[OUTPUT] upsert completed successfully",
+                outputs={
+                    "updated": True,
+                    "namespace": self.namespace,
+                    "total_records": len(data),
+                    "new_records_count": len(new_keys),
+                    "updated_records_count": len(updated_keys),
+                    "new_keys": new_keys,
+                    "updated_keys": updated_keys,
+                    "current_time": current_time,
+                },
+                level="info",
+            )
 
     async def delete(self, ids: list[str]) -> None:
         """Delete specific records from storage by their IDs

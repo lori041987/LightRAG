@@ -80,6 +80,7 @@ wnc_log(
 ### Rule 2: Add logs before each return
 Shows outputs only with `[OUTPUT]` prefix in purpose
 
+**For normal returns:**
 ```python
 wnc_log(
     purpose="[OUTPUT] Brief description of this return branch",
@@ -88,6 +89,23 @@ wnc_log(
 )
 return result
 ```
+
+**For early returns (unexpected/exceptional returns):**
+Add "early return" in the purpose to indicate the function is returning before normal completion:
+```python
+wnc_log(
+    purpose="[OUTPUT] function_name early return - reason",
+    outputs={...},
+    level="trace",
+)
+return result
+```
+
+Examples of early returns:
+- `"[OUTPUT] handle_cache early return - no hashing_kv"`
+- `"[OUTPUT] handle_cache early return - cache disabled for queries"`
+- `"[OUTPUT] _locked_process_entity_name early return - cancelled"`
+- `"[OUTPUT] _locked_process_edges early return - edge_data is None"`
 
 ---
 
@@ -469,7 +487,93 @@ def __post_init__(self):
     # ... function body (no explicit return statement) ...
 ```
 
-### Example 4: Function with complex inputs/outputs
+### Example 4: Function with early returns
+
+```python
+async def handle_cache(
+    hashing_kv: BaseKVStorage,
+    args_hash: str,
+    cache_type: str = "default",
+    mode: str = "default",
+) -> tuple[str, int] | None:
+    """Check LLM response cache for existing result"""
+
+    # Initial log
+    wnc_log(
+        purpose="Checks llm_response_cache for existing LLM response matching the args_hash, returns cached content and timestamp if found, otherwise None",
+        inputs={
+            "hashing_kv": "provided" if hashing_kv else "None",
+            "args_hash": args_hash,
+            "cache_type": cache_type,
+            "mode": mode,
+        },
+        side_effects="Reads from llm_response_cache via hashing_kv.get_by_id (kv_store_llm_response_cache.json).\n"
+                    "No writes - this is a read-only cache lookup function.",
+        note="Called by use_llm_func_with_cache to check cache before LLM call.\n"
+             "Returns None in three cases: hashing_kv is None, cache disabled by config, cache miss.",
+        level="trace",
+    )
+
+    # Early return 1: No storage provided
+    if hashing_kv is None:
+        wnc_log(
+            purpose="[OUTPUT] handle_cache early return - no hashing_kv",
+            outputs={"result": None, "reason": "hashing_kv is None"},
+            level="trace",
+        )
+        return None
+
+    # Early return 2: Cache disabled for queries
+    if mode != "default":
+        if not hashing_kv.global_config.get("enable_llm_cache"):
+            wnc_log(
+                purpose="[OUTPUT] handle_cache early return - cache disabled for queries",
+                outputs={"result": None, "reason": "enable_llm_cache is False", "mode": mode},
+                level="trace",
+            )
+            return None
+
+    # Early return 3: Cache disabled for entity extraction
+    else:
+        if not hashing_kv.global_config.get("enable_llm_cache_for_entity_extract"):
+            wnc_log(
+                purpose="[OUTPUT] handle_cache early return - cache disabled for entity extraction",
+                outputs={"result": None, "reason": "enable_llm_cache_for_entity_extract is False", "mode": mode},
+                level="trace",
+            )
+            return None
+
+    # Normal flow: Check cache
+    cache_entry = await hashing_kv.get_by_id(args_hash)
+
+    if cache_entry:
+        content = cache_entry["return"]
+        timestamp = cache_entry.get("create_time", 0)
+
+        # Normal return: Cache hit
+        wnc_log(
+            purpose="[OUTPUT] handle_cache cache hit",
+            outputs={
+                "result": (content, timestamp),
+                "cache_hit": True,
+                "args_hash": args_hash,
+                "content": content,
+                "timestamp": timestamp,
+            },
+            level="trace",
+        )
+        return content, timestamp
+
+    # Normal return: Cache miss
+    wnc_log(
+        purpose="[OUTPUT] handle_cache cache miss",
+        outputs={"result": None, "cache_hit": False, "args_hash": args_hash},
+        level="trace",
+    )
+    return None
+```
+
+### Example 5: Function with complex inputs/outputs
 
 ```python
 async def use_llm_func_with_cache(
@@ -537,6 +641,7 @@ When adding `wnc_log` to a function:
 - [ ] Initial log at the beginning with `purpose`, `inputs`, `side_effects`, `note`
 - [ ] Set `outputs=None` if function doesn't return a value
 - [ ] Add `[OUTPUT]` log before EACH return statement
+- [ ] For early returns, add "early return" in purpose: `"[OUTPUT] function_name early return - reason"`
 - [ ] Use `level="trace"` for all logs
 - [ ] Pass dicts directly (no manual `json.dumps()`)
 - [ ] Use clear, readable field names with spaces: `"original length"` not `"original_length"`
@@ -619,6 +724,24 @@ outputs={
     "original length": len(content),  # Descriptive field - use space
     "track_id": track_id,          # Actual variable name
 }
+```
+
+❌ **Don't** forget "early return" wording for unexpected returns
+```python
+# BAD - unclear if this is expected or unexpected
+wnc_log(
+    purpose="[OUTPUT] handle_cache no hashing_kv",
+    outputs={"result": None},
+)
+```
+
+✅ **Do** add "early return" for unexpected/exceptional returns
+```python
+# GOOD - clearly indicates unexpected early exit
+wnc_log(
+    purpose="[OUTPUT] handle_cache early return - no hashing_kv",
+    outputs={"result": None, "reason": "hashing_kv is None"},
+)
 ```
 
 ---

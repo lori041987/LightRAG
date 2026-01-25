@@ -328,6 +328,28 @@ class NanoVectorDBStorage(BaseVectorStorage):
 
     async def index_done_callback(self) -> bool:
         """Save data to disk"""
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Flushes in-memory NanoVectorDB to disk by calling _client.save() (COMMIT operation), or reloads from disk if another process updated storage",
+            inputs={
+                "namespace": self.namespace,
+                "workspace": self.workspace,
+                "client_file_name": self._client_file_name,
+                "storage_updated": self.storage_updated.value,
+            },
+            outputs=None,
+            side_effects="Reads storage_updated flag to check if another process modified storage.\n"
+                        "If another process updated: reloads _client from disk via NanoVectorDB constructor (DISK I/O read).\n"
+                        "If no conflict: writes _client to disk via _client.save() (DISK I/O write: vdb_entities.json, vdb_relationships.json, vdb_chunks.json).\n"
+                        "Sets update flags via set_all_update_flags to notify other processes.",
+            note="Called by _insert_done after document processing completes (lightrag/lightrag.py:2467-2545).\n"
+                 "This is the COMMIT point - all prior upsert() calls are flushed to disk here.\n"
+                 "Returns False if storage was updated by another process (conflict detected).\n"
+                 "Returns True on successful save.\n"
+                 "Contrast with upsert(): index_done_callback does DISK I/O, upsert only modifies in-memory _client.",
+            level="info",
+        )
+
         async with self._storage_lock:
             # Check if storage was updated by another process
             if self.storage_updated.value:
@@ -341,6 +363,20 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 )
                 # Reset update flag
                 self.storage_updated.value = False
+
+                # [WNC] Output log for conflict/reload
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback - conflict detected, reloaded from disk",
+                    outputs={
+                        "persisted": False,
+                        "reloaded": True,
+                        "reason": "storage_updated by another process",
+                        "namespace": self.namespace,
+                        "file_name": self._client_file_name,
+                    },
+                    level="info",
+                )
+
                 return False  # Return error
 
         # Acquire lock and perform persistence
@@ -352,11 +388,36 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
                 # Reset own update flag to avoid self-reloading
                 self.storage_updated.value = False
+
+                # [WNC] Output log for successful save
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback completed - data persisted",
+                    outputs={
+                        "persisted": True,
+                        "namespace": self.namespace,
+                        "file_name": self._client_file_name,
+                    },
+                    level="info",
+                )
+
                 return True  # Return success
             except Exception as e:
                 logger.error(
                     f"[{self.workspace}] Error saving data for {self.namespace}: {e}"
                 )
+
+                # [WNC] Output log for save error
+                wnc_log(
+                    purpose="[OUTPUT] index_done_callback - save error",
+                    outputs={
+                        "persisted": False,
+                        "reason": "exception during save",
+                        "namespace": self.namespace,
+                        "error": str(e),
+                    },
+                    level="info",
+                )
+
                 return False  # Return error
 
         return True  # Return success
