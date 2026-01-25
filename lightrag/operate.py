@@ -1628,6 +1628,38 @@ async def _merge_nodes_then_upsert(
     entity_chunks_storage: BaseKVStorage | None = None,
 ):
     """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
+
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Checks if entity exists in knowledge graph; if exists, merges with new nodes and summarizes via LLM if needed; if not exists, creates new entity; then upserts to graph storage and vector database",
+        inputs={
+            "entity_name": entity_name,
+            "nodes_data": nodes_data,
+            "nodes count": len(nodes_data),
+            "entity_vdb": "provided" if entity_vdb else "None",
+            "entity_chunks_storage": "provided" if entity_chunks_storage else "None",
+            "llm_response_cache": "provided" if llm_response_cache else "None",
+            "max_source_ids_per_entity": global_config.get("max_source_ids_per_entity"),
+            "source_ids_limit_method": global_config.get("source_ids_limit_method"),
+        },
+        outputs=None,
+        side_effects="Reads existing node from knowledge graph via knowledge_graph_inst.get_node.\n"
+                    "Reads existing chunks from entity_chunks_storage.get_by_id if provided.\n"
+                    "Writes to entity_chunks_storage via entity_chunks_storage.upsert (kv_store_entity_chunks.json).\n"
+                    "Writes to knowledge graph via knowledge_graph_inst.upsert_node (graph_chunk_entity_relation.graphml).\n"
+                    "Writes to entity vector database via entity_vdb.upsert (vdb_entities.json) if entity_vdb is provided.\n"
+                    "May call LLM for summarization via _handle_entity_relation_summary (writes to llm_response_cache if cache enabled).\n"
+                    "Updates pipeline_status latest_message and history_messages if merge or LLM usage occurs.",
+        note="Merges source_ids from existing node and new nodes, applies source_ids limit (FIFO or KEEP method).\n"
+             "Deduplicates descriptions, sorts by timestamp and length, combines with existing descriptions.\n"
+             "May skip summary if KEEP method reaches limit and no new descriptions.\n"
+             "Limits file_paths to max_file_paths, adds placeholder if truncated.\n"
+             "Returns early with existing node data if skipping due to source_ids limit.\n"
+             "Raises ValueError if entity has no description or if internal error with missing already_node.\n"
+             "Raises PipelineCancelledException if cancellation requested before LLM summary.",
+        level="info",
+    )
+
     already_entity_types = []
     already_source_ids = []
     already_description = []
@@ -1708,6 +1740,19 @@ async def _merge_nodes_then_upsert(
                 f"Skipped `{entity_name}`: KEEP old chunks {already_source_ids}/{len(full_source_ids)}"
             )
             existing_node_data = dict(already_node)
+
+            # [WNC] Output log for early return (skipped due to limit)
+            wnc_log(
+                purpose="[OUTPUT] _merge_nodes_then_upsert skipped - KEEP limit reached",
+                outputs={
+                    "entity_name": entity_name,
+                    "action": "skipped - KEEP old chunks",
+                    "source_ids kept": already_source_ids,
+                    "total source_ids": len(full_source_ids),
+                    "existing_node_data": existing_node_data,
+                },
+                level="info",
+            )
             return existing_node_data
         else:
             logger.error(f"Internal Error: already_node missing for `{entity_name}`")
@@ -1891,6 +1936,54 @@ async def _merge_nodes_then_upsert(
             max_retries=3,
             retry_delay=0.1,
         )
+
+    # [WNC] Output log for successful completion - with explicit action summary
+    actions_performed = []
+    if already_fragment == 0:
+        actions_performed.append("Created new entity in knowledge graph")
+    else:
+        actions_performed.append(f"Merged with existing entity: {already_fragment} old + {num_fragment - already_fragment} new descriptions")
+
+    if llm_was_used:
+        actions_performed.append("Applied LLM summarization to combine descriptions")
+    else:
+        actions_performed.append("No LLM summarization needed (single description)")
+
+    if deduplicated_num > 0:
+        actions_performed.append(f"Deduplicated {deduplicated_num} duplicate descriptions")
+
+    if truncation_info:
+        actions_performed.append(f"Applied source_ids truncation: {truncation_info}")
+
+    # Get file paths from storage instances for logging
+    graph_file = getattr(knowledge_graph_inst, '_graphml_xml_file', 'graph storage')
+    actions_performed.append(f"Upserted node to knowledge graph → {graph_file}")
+
+    if entity_vdb is not None:
+        entity_vdb_file = getattr(entity_vdb, '_client_file_name', 'entity vector database')
+        actions_performed.append(f"Upserted entity → {entity_vdb_file}")
+
+    if entity_chunks_storage is not None:
+        entity_chunks_file = getattr(entity_chunks_storage, '_file_name', 'entity chunks storage')
+        actions_performed.append(f"Updated entity chunks storage ({len(full_source_ids)} chunk IDs) → {entity_chunks_file}")
+
+    wnc_log(
+        purpose="[OUTPUT] _merge_nodes_then_upsert completed successfully",
+        outputs={
+            "entity_name": entity_name,
+            "actions performed": actions_performed,
+            "node_data": node_data,
+            "llm_was_used": llm_was_used,
+            "descriptions count": num_fragment,
+            "already descriptions": already_fragment,
+            "new descriptions": num_fragment - already_fragment,
+            "source_ids count": len(source_ids),
+            "full_source_ids count": len(full_source_ids),
+            "truncation_info": truncation_info if truncation_info else "None",
+            "deduplicated_num": deduplicated_num,
+        },
+        level="info",
+    )
     return node_data
 
 
@@ -1909,7 +2002,56 @@ async def _merge_edges_then_upsert(
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
 ):
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Checks if relationship edge exists in knowledge graph; if exists, merges with new edges and summarizes via LLM if needed; if not exists, creates new edge; creates missing src/tgt entities if needed; then upserts to graph storage and vector database",
+        inputs={
+            "src_id": src_id,
+            "tgt_id": tgt_id,
+            "edges_data": edges_data,
+            "edges count": len(edges_data),
+            "relationships_vdb": "provided" if relationships_vdb else "None",
+            "entity_vdb": "provided" if entity_vdb else "None",
+            "relation_chunks_storage": "provided" if relation_chunks_storage else "None",
+            "entity_chunks_storage": "provided" if entity_chunks_storage else "None",
+            "llm_response_cache": "provided" if llm_response_cache else "None",
+            "max_source_ids_per_relation": global_config.get("max_source_ids_per_relation"),
+            "source_ids_limit_method": global_config.get("source_ids_limit_method"),
+        },
+        outputs=None,
+        side_effects="Reads existing edge from knowledge graph via knowledge_graph_inst.get_edge.\n"
+                    "Reads existing chunks from relation_chunks_storage.get_by_id if provided.\n"
+                    "Writes to relation_chunks_storage via relation_chunks_storage.upsert (kv_store_relation_chunks.json).\n"
+                    "Writes to knowledge graph via knowledge_graph_inst.upsert_edge (graph_chunk_entity_relation.graphml).\n"
+                    "Writes to relationships vector database via relationships_vdb.upsert (vdb_relationships.json) if provided.\n"
+                    "May create missing entities: writes to knowledge graph, entity_chunks_storage, and entity_vdb.\n"
+                    "May call LLM for summarization via _handle_entity_relation_summary (writes to llm_response_cache if cache enabled).\n"
+                    "Deletes old relationship vector records from relationships_vdb before upserting new ones.\n"
+                    "Updates pipeline_status latest_message and history_messages if merge or LLM usage occurs.",
+        note="Returns None early if src_id equals tgt_id (self-loop).\n"
+             "Merges source_ids from existing edge and new edges, applies source_ids limit (FIFO or KEEP method).\n"
+             "Deduplicates descriptions, sorts by timestamp and length, combines with existing descriptions.\n"
+             "May skip summary if KEEP method reaches limit and no new descriptions.\n"
+             "Merges weights (sums all weights), keywords (unique sorted set), and file_paths (with limit).\n"
+             "Creates missing entities with type UNKNOWN if src_id or tgt_id not in graph (tracked in added_entities list).\n"
+             "Updates existing entity source_ids via entity_chunks_storage if entity already exists.\n"
+             "Sorts src_id/tgt_id to ensure consistent ordering before VDB upsert.\n"
+             "Raises ValueError if relation has no description or if internal error with missing already_edge.\n"
+             "Raises PipelineCancelledException if cancellation requested before LLM summary.",
+        level="info",
+    )
+
     if src_id == tgt_id:
+        # [WNC] Output log for self-loop early return
+        wnc_log(
+            purpose="[OUTPUT] _merge_edges_then_upsert early return - self-loop",
+            outputs={
+                "src_id": src_id,
+                "tgt_id": tgt_id,
+                "action": "skipped - self-loop (src_id == tgt_id)",
+            },
+            level="info",
+        )
         return None
 
     already_edge = None
@@ -2024,6 +2166,20 @@ async def _merge_edges_then_upsert(
                 f"Skipped `{src_id}`~`{tgt_id}`: KEEP old chunks  {already_source_ids}/{len(full_source_ids)}"
             )
             existing_edge_data = dict(already_edge)
+
+            # [WNC] Output log for early return (skipped due to limit)
+            wnc_log(
+                purpose="[OUTPUT] _merge_edges_then_upsert skipped - KEEP limit reached",
+                outputs={
+                    "src_id": src_id,
+                    "tgt_id": tgt_id,
+                    "action": "skipped - KEEP old chunks",
+                    "source_ids kept": already_source_ids,
+                    "total source_ids": len(full_source_ids),
+                    "existing_edge_data": existing_edge_data,
+                },
+                level="info",
+            )
             return existing_edge_data
         else:
             logger.error(
@@ -2418,6 +2574,71 @@ async def _merge_edges_then_upsert(
             retry_delay=0.2,
         )
 
+    # [WNC] Output log for successful completion - with explicit action summary
+    actions_performed = []
+    if already_fragment == 0:
+        actions_performed.append("Created new relationship edge in knowledge graph")
+    else:
+        actions_performed.append(f"Merged with existing edge: {already_fragment} old + {num_fragment - already_fragment} new descriptions")
+
+    if llm_was_used:
+        actions_performed.append("Applied LLM summarization to combine descriptions")
+    else:
+        actions_performed.append("No LLM summarization needed (single description)")
+
+    if deduplicated_num > 0:
+        actions_performed.append(f"Deduplicated {deduplicated_num} duplicate descriptions")
+
+    actions_performed.append(f"Merged weights (sum: {weight}) and keywords ({len(all_keywords)} unique)")
+
+    if truncation_info:
+        actions_performed.append(f"Applied source_ids truncation: {truncation_info}")
+
+    if added_entities and len(added_entities) > 0:
+        actions_performed.append(f"Created {len(added_entities)} missing entities (type: UNKNOWN)")
+
+    # Get file paths from storage instances for logging
+    graph_file = getattr(knowledge_graph_inst, '_graphml_xml_file', 'graph storage')
+    actions_performed.append(f"Upserted edge to knowledge graph → {graph_file}")
+
+    if relationships_vdb is not None:
+        # Note: The code always calls "await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])" before upsert, even for new relationships.
+        # NanoVectorDB's delete() doesn't throw exception when IDs don't exist - it just does nothing (no-op).
+        # So for new relationships, delete succeeds but removes 0 items; for existing relationships, it removes old vectors.
+        # We differentiate the log message based on whether this is a new or existing relationship.
+        rel_vdb_file = getattr(relationships_vdb, '_client_file_name', 'relationships vector database')
+        if already_fragment == 0:
+            # New relationship - no old vectors existed to delete
+            actions_performed.append(f"Upserted new relationship → {rel_vdb_file}")
+        else:
+            # Existing relationship - old vectors were cleaned up before upserting
+            actions_performed.append(f"Cleaned up old vectors and upserted updated relationship → {rel_vdb_file}")
+
+    if relation_chunks_storage is not None:
+        rel_chunks_file = getattr(relation_chunks_storage, '_file_name', 'relation chunks storage')
+        actions_performed.append(f"Updated relation chunks storage ({len(full_source_ids)} chunk IDs) → {rel_chunks_file}")
+
+    wnc_log(
+        purpose="[OUTPUT] _merge_edges_then_upsert completed successfully",
+        outputs={
+            "src_id": src_id,
+            "tgt_id": tgt_id,
+            "actions performed": actions_performed,
+            "edge_data": edge_data,
+            "llm_was_used": llm_was_used,
+            "descriptions count": num_fragment,
+            "already descriptions": already_fragment,
+            "new descriptions": num_fragment - already_fragment,
+            "weight": weight,
+            "keywords count": len(all_keywords),
+            "source_ids count": len(source_ids),
+            "full_source_ids count": len(full_source_ids),
+            "truncation_info": truncation_info if truncation_info else "None",
+            "deduplicated_num": deduplicated_num,
+            "added_entities count": len(added_entities) if added_entities else 0,
+        },
+        level="info",
+    )
     return edge_data
 
 
@@ -2464,6 +2685,44 @@ async def merge_nodes_and_edges(
         total_files: Total files for logging
         file_path: File path for logging
     """
+
+    # [WNC] Initial log at function entry
+    wnc_log(
+        purpose="Consolidates extracted entities and relationships across chunks using two-phase merge (entities first, then relationships) and updates knowledge graph, vector databases, and document-level indexes",
+        inputs={
+            "chunk_results": chunk_results,
+            "doc_id": doc_id if doc_id else "None",
+            "file_path": file_path,
+            "current_file_number": current_file_number,
+            "total_files": total_files,
+            "chunk results count": len(chunk_results),
+            "entity_vdb": "provided" if entity_vdb else "None",
+            "relationships_vdb": "provided" if relationships_vdb else "None",
+            "full_entities_storage": "provided" if full_entities_storage else "None",
+            "full_relations_storage": "provided" if full_relations_storage else "None",
+            "entity_chunks_storage": "provided" if entity_chunks_storage else "None",
+            "relation_chunks_storage": "provided" if relation_chunks_storage else "None",
+            "llm_response_cache": "provided" if llm_response_cache else "None",
+            "graph max async": global_config.get("llm_model_max_async", 4) * 2,
+        },
+        outputs=None,
+        side_effects="Writes to knowledge graph (graph_chunk_entity_relation.graphml via NetworkXStorage.index_done_callback).\n"
+                    "Writes to entity vector database (vdb_entities.json via NanoVectorDBStorage.index_done_callback).\n"
+                    "Writes to relationship vector database (vdb_relationships.json via NanoVectorDBStorage.index_done_callback).\n"
+                    "Writes to entity chunks storage (kv_store_entity_chunks.json via entity_chunks_storage.upsert).\n"
+                    "Writes to relation chunks storage (kv_store_relation_chunks.json via relation_chunks_storage.upsert).\n"
+                    "Writes to full entities storage (kv_store_full_entities.json via full_entities_storage.upsert).\n"
+                    "Writes to full relations storage (kv_store_full_relations.json via full_relations_storage.upsert).\n"
+                    "May write to LLM response cache (kv_store_llm_response_cache.json) if entity/relation summarization is triggered.\n"
+                    "Updates pipeline_status shared namespace.",
+        note="Three-phase process: (1) Process all entities concurrently with semaphore control (2) Process all relationships concurrently (may add missing entities) (3) Update full_entities and full_relations storage with final results.\n"
+             "Each phase uses asyncio.wait with FIRST_EXCEPTION to cancel remaining tasks on first failure.\n"
+             "Entity and relationship processing are locked per entity name / relation pair via get_storage_keyed_lock.\n"
+             "May trigger optional LLM summarization for entities/relations if configured.\n"
+             "Embedding requirement is 'required' if entity_vdb or relationships_vdb is provided, otherwise 'no'.\n"
+             "Raises PipelineCancelledException if cancellation is requested during any phase.",
+        level="info",
+    )
 
     # Check for cancellation at the start of merge
     if pipeline_status is not None and pipeline_status_lock is not None:
@@ -2808,6 +3067,21 @@ async def merge_nodes_and_edges(
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
         pipeline_status["history_messages"].append(log_message)
+
+    # [WNC] Output log at function completion
+    wnc_log(
+        purpose="[OUTPUT] merge_nodes_and_edges completed successfully",
+        outputs={
+            "doc_id": doc_id if doc_id else "None",
+            "processed_entities": processed_entities,
+            "all_added_entities": all_added_entities,
+            "processed_edges": processed_edges,
+            "processed entities count": len(processed_entities),
+            "added entities count": len(all_added_entities),
+            "processed edges count": len(processed_edges),
+        },
+        level="info",
+    )
 
 
 async def extract_entities(

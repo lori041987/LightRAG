@@ -2467,6 +2467,56 @@ class LightRAG:
     async def _insert_done(
         self, pipeline_status=None, pipeline_status_lock=None
     ) -> None:
+        # [WNC] Initial log at function entry
+        storage_info = [
+            ("full_docs", self.full_docs),
+            ("doc_status", self.doc_status),
+            ("text_chunks", self.text_chunks),
+            ("full_entities", self.full_entities),
+            ("full_relations", self.full_relations),
+            ("entity_chunks", self.entity_chunks),
+            ("relation_chunks", self.relation_chunks),
+            ("llm_response_cache", self.llm_response_cache),
+            ("entities_vdb", self.entities_vdb),
+            ("relationships_vdb", self.relationships_vdb),
+            ("chunks_vdb", self.chunks_vdb),
+            ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
+        ]
+        active_storages = [
+            {"name": name, "class": storage_inst.__class__.__name__}
+            for name, storage_inst in storage_info if storage_inst is not None
+        ]
+
+        wnc_log(
+            purpose="Flushes all in-memory storages to disk by calling index_done_callback on each storage instance (KV stores, document status, vector databases, and knowledge graph)",
+            inputs={
+                "pipeline_status": "provided" if pipeline_status else "None",
+                "pipeline_status_lock": "provided" if pipeline_status_lock else "None",
+                "active storages": active_storages,
+                "storage count": len(active_storages),
+            },
+            outputs=None,
+            side_effects="Writes to all active storage files under working_dir:\n"
+                        "- kv_store_full_docs.json (full_docs via JsonKVStorage.index_done_callback)\n"
+                        "- kv_store_doc_status.json (doc_status via JsonDocStatusStorage.index_done_callback)\n"
+                        "- kv_store_text_chunks.json (text_chunks via JsonKVStorage.index_done_callback)\n"
+                        "- kv_store_full_entities.json (full_entities via JsonKVStorage.index_done_callback)\n"
+                        "- kv_store_full_relations.json (full_relations via JsonKVStorage.index_done_callback)\n"
+                        "- kv_store_entity_chunks.json (entity_chunks via JsonKVStorage.index_done_callback)\n"
+                        "- kv_store_relation_chunks.json (relation_chunks via JsonKVStorage.index_done_callback)\n"
+                        "- kv_store_llm_response_cache.json (llm_response_cache via JsonKVStorage.index_done_callback)\n"
+                        "- vdb_entities.json (entities_vdb via NanoVectorDBStorage.index_done_callback)\n"
+                        "- vdb_relationships.json (relationships_vdb via NanoVectorDBStorage.index_done_callback)\n"
+                        "- vdb_chunks.json (chunks_vdb via NanoVectorDBStorage.index_done_callback)\n"
+                        "- graph_chunk_entity_relation.graphml (chunk_entity_relation_graph via NetworkXStorage.index_done_callback)\n"
+                        "Updates pipeline_status latest_message and history_messages if provided.",
+            note="Called after each successfully processed document (lightrag/lightrag.py:2067-2069) and in insert_custom_chunks finalize path.\n"
+                 "Uses asyncio.gather to persist all storages concurrently.\n"
+                 "Only storages that are not None are included in the persistence tasks.\n"
+                 "If any index_done_callback fails, exception propagates to caller unless swallowed inside storage implementations.",
+            level="info",
+        )
+
         tasks = [
             cast(StorageNameSpace, storage_inst).index_done_callback()
             for storage_inst in [  # type: ignore
@@ -2494,6 +2544,17 @@ class LightRAG:
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
+
+        # [WNC] Output log at function completion
+        wnc_log(
+            purpose="[OUTPUT] _insert_done completed successfully",
+            outputs={
+                "persisted storages": active_storages,
+                "storage count": len(active_storages),
+                "message": log_message,
+            },
+            level="info",
+        )
 
     def insert_custom_kg(
         self, custom_kg: dict[str, Any], full_doc_id: str = None

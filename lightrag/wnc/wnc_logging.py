@@ -8,6 +8,7 @@ wnc_docs/code_analysis_index_260123.txt requirements.
 import inspect
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 # Get WNC-specific logger instance (separate from main lightrag logger)
@@ -74,6 +75,49 @@ def get_trace_content_limit() -> int:
     return _TRACE_CONTENT_LIMIT
 
 
+def _is_timestamp_field(key: str, value: Any) -> bool:
+    """
+    Detect if a key-value pair represents a Unix timestamp.
+
+    Args:
+        key: The field name
+        value: The field value
+
+    Returns:
+        True if this appears to be a timestamp field
+    """
+    # Check if key suggests timestamp
+    timestamp_keywords = ['timestamp', 'created_at', 'updated_at', 'time', 'date']
+    key_lower = key.lower()
+    has_timestamp_keyword = any(keyword in key_lower for keyword in timestamp_keywords)
+
+    # Check if value is a reasonable Unix timestamp (integer in reasonable range)
+    # Unix timestamps are typically 10 digits (seconds since 1970)
+    # Range: 2001-09-09 to 2286-11-20 (1 billion to 10 billion)
+    if isinstance(value, int) and 1_000_000_000 <= value <= 10_000_000_000:
+        return has_timestamp_keyword or True  # Accept any integer in this range
+
+    return False
+
+
+def _convert_timestamp_to_readable(timestamp: int) -> str:
+    """
+    Convert Unix timestamp to human-readable format.
+
+    Args:
+        timestamp: Unix timestamp (seconds since epoch)
+
+    Returns:
+        Human-readable datetime string in UTC
+    """
+    try:
+        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, OSError):
+        # Handle invalid timestamps
+        return f"<invalid timestamp: {timestamp}>"
+
+
 def _make_json_serializable(obj: Any) -> Any:
     """
     Recursively convert non-JSON-serializable objects to JSON-serializable formats.
@@ -83,6 +127,7 @@ def _make_json_serializable(obj: Any) -> Any:
     - Sets -> Lists
     - Callables/Functions -> Function name string
     - Dictionaries with tuple keys -> Dictionaries with string keys (tuple converted to string)
+    - Timestamp detection -> Adds human-readable timestamp alongside Unix timestamp
     - Other types -> String representation
 
     Args:
@@ -131,7 +176,15 @@ def _make_json_serializable(obj: Any) -> Any:
             else:
                 serializable_key = key
 
-            result[serializable_key] = _make_json_serializable(value)
+            # Recursively process the value
+            serializable_value = _make_json_serializable(value)
+            result[serializable_key] = serializable_value
+
+            # Detect timestamp fields and add human-readable version
+            if _is_timestamp_field(str(serializable_key), value):
+                readable_key = f"{serializable_key} (readable)"
+                result[readable_key] = _convert_timestamp_to_readable(value)
+
         return result
 
     # For other types, convert to string representation

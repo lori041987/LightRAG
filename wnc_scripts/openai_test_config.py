@@ -59,10 +59,10 @@ class OpenAISettings:
 class OpenAITestConfig:
     #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb"
     #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/3gpp"
-    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260120_1"
+    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260123"
 
     #working_dir: str = "/srv/ai/LightRAG/rag_storage/openai_3gpp"
-    working_dir: str = "/srv/ai/LightRAG/rag_storage/openai_test_json_260120_1"
+    working_dir: str = "/srv/ai/LightRAG/rag_storage/test_json_260123"
 
     mode: Literal["naive", "local", "global", "hybrid", "mix", "bypass"] = "hybrid"
     skip_index: bool = False

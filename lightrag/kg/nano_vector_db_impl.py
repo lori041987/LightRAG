@@ -11,6 +11,7 @@ from lightrag.utils import (
     logger,
     compute_mdhash_id,
 )
+from lightrag.wnc import wnc_log
 
 from lightrag.base import BaseVectorStorage
 from nano_vectordb import NanoVectorDB
@@ -100,8 +101,37 @@ class NanoVectorDBStorage(BaseVectorStorage):
         2. Only one process should updating the storage at a time before index_done_callback,
            KG-storage-log should be used to avoid data corruption
         """
+        # [WNC] Initial log at function entry
+        wnc_log(
+            purpose="Computes embeddings for content items, compresses vectors using Float16+zlib+Base64, and upserts into NanoVectorDB in-memory storage",
+            inputs={
+                "data": data,
+                "data count": len(data) if data else 0,
+                "namespace": self.namespace,
+                "workspace": self.workspace,
+                "max_batch_size": self._max_batch_size,
+                "meta_fields": self.meta_fields,
+            },
+            outputs=None,
+            side_effects="Updates in-memory NanoVectorDB state (not persisted until index_done_callback is called).\n"
+                        "Will be persisted to vdb_<namespace>.json file (e.g., vdb_chunks.json, vdb_entities.json, vdb_relationships.json) on next index_done_callback.\n"
+                        "Calls embedding_func to generate embeddings for all content items (may trigger provider network calls).",
+            note="Called by process_document for chunks (lightrag/lightrag.py:1916-1918) and by merge stage for entities/relations.\n"
+                 "Executes embedding outside of lock to avoid long lock times.\n"
+                 "Uses batching with max_batch_size to process embeddings efficiently.\n"
+                 "If embedding count mismatches data count, logs error and returns without upserting.\n"
+                 "Returns early if data is empty.",
+            level="info",
+        )
+
         # logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
         if not data:
+            # [WNC] Output log for early return
+            wnc_log(
+                purpose="[OUTPUT] upsert early return - empty data",
+                outputs={"data count": 0, "action": "skipped"},
+                level="info",
+            )
             return
 
         current_time = int(time.time())
@@ -134,11 +164,37 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 d["__vector__"] = embeddings[i]
             client = await self._get_client()
             results = client.upsert(datas=list_data)
+
+            # [WNC] Output log for successful upsert
+            wnc_log(
+                purpose="[OUTPUT] upsert completed successfully",
+                outputs={
+                    "namespace": self.namespace,
+                    "workspace": self.workspace,
+                    "upserted count": len(list_data),
+                    "batch count": len(batches),
+                    "current_time": current_time,
+                },
+                level="info",
+            )
             return results
         else:
             # sometimes the embedding is not returned correctly. just log it.
             logger.error(
                 f"[{self.workspace}] embedding is not 1-1 with data, {len(embeddings)} != {len(list_data)}"
+            )
+
+            # [WNC] Output log for embedding mismatch error
+            wnc_log(
+                purpose="[OUTPUT] upsert failed - embedding count mismatch",
+                outputs={
+                    "namespace": self.namespace,
+                    "workspace": self.workspace,
+                    "embeddings count": len(embeddings),
+                    "data count": len(list_data),
+                    "error": "embedding count does not match data count",
+                },
+                level="info",
             )
 
     async def query(

@@ -1,0 +1,1024 @@
+# INDEXING STAGE
+
+  - ## 0. Entry points (Summary)
+      - Python (package)
+          - Function/class name (entry point): LightRAG.insert (sync) / LightRAG.ainsert (async)
+          - Code location: lightrag/lightrag.py:1115 / lightrag/lightrag.py:1151
+          - Code snippet (10–20 lines):
+
+            def insert(
+                self,
+                input: str | list[str],
+                split_by_character: str | None = None,
+                split_by_character_only: bool = False,
+                ids: str | list[str] | None = None,
+                file_paths: str | list[str] | None = None,
+                track_id: str | None = None,
+            ) -> str:
+                loop = always_get_an_event_loop()
+                return loop.run_until_complete(
+                    self.ainsert(
+                        input,
+                        split_by_character,
+                        split_by_character_only,
+                        ids,
+                        file_paths,
+                        track_id,
+                    )
+                )
+          - How it’s invoked (example call): rag.insert(docs, file_paths=file_paths, ids=doc_ids)
+      - API (FastAPI)
+          - Function/class name (entry point): pipeline_index_texts (calls rag.apipeline_enqueue_documents → rag.apipeline_process_enqueue_documents)
+          - Code location: lightrag/api/routers/document_routes.py:1700
+          - Code snippet (10–20 lines):
+
+            async def pipeline_index_texts(
+                rag: LightRAG,
+                texts: List[str],
+                file_sources: List[str] = None,
+                track_id: str = None,
+            ):
+                if not texts:
+                    return
+                if file_sources is not None:
+                    if len(file_sources) != 0 and len(file_sources) != len(texts):
+                        [file_sources.append("unknown_source") for _ in range(len(file_sources), len(texts))]
+                await rag.apipeline_enqueue_documents(
+                    input=texts, file_paths=file_sources, track_id=track_id
+                )
+                await rag.apipeline_process_enqueue_documents()
+          - How it’s invoked (example endpoint): via document routes wired by create_document_routes(...) (e.g. upload/scan endpoints enqueue docs, then process
+            queue).
+      - CLI
+          - Function/class name (entry point): lightrag-server → lightrag.api.lightrag_server:main (starts API server; indexing then happens via API routes)
+          - Code location: pyproject.toml:154 and lightrag/api/lightrag_server.py:1470
+          - Code snippet (10–20 lines):
+
+            def main():
+                from .config import initialize_config
+                initialize_config()
+
+                if "GUNICORN_CMD_ARGS" in os.environ:
+                    print("Running under Gunicorn - worker management handled by Gunicorn")
+                    return
+
+                if not check_env_file():
+                    sys.exit(1)
+
+                check_and_install_dependencies()
+                from multiprocessing import freeze_support
+                freeze_support()
+                configure_logging()
+                update_uvicorn_mode_config()
+                display_splash_screen(global_args)
+          - How it’s invoked (example command): lightrag-server
+      - Entry point used by wnc_scripts/openai_test.py: Python (package) → LightRAG.insert (sync) called from wnc_scripts/openai_test.py:396
+  - ## 1. Build raw index inputs (Summary)
+      - Purpose: Load files under kdb_dir, convert them into text documents, and produce (docs, file_paths) fed into rag.insert(...).
+      - Functions involved (names + locations only):
+          - main — wnc_scripts/openai_test.py:95
+          - load_mixed_docs — wnc_scripts/utils_test.py:315
+          - sample_json_to_doc_text — wnc_scripts/utils_test.py:180
+          - json_value_to_text — wnc_scripts/utils_test.py:170
+      - Outputs/artifacts touched (high level): none of the rag_storage/* artifacts yet; only in-memory docs: list[str], file_paths: list[str].
+  - ## 1.1 wnc_scripts/openai_test.py:main
+      - Function/class name: main
+      - Purpose: Orchestrate loading docs, configuring LightRAG, initializing storages, calling rag.insert(...).
+      - Trigger/Caller: if __name__ == "__main__": main() (wnc_scripts/openai_test.py:559)
+      - Code location(s): wnc_scripts/openai_test.py:95
+      - Code snippet (10–20 lines):
+
+        if ingest_backend == "simple":
+            docs, file_paths = load_mixed_docs(
+                kdb_dir=kdb_dir,
+                include_ground_truth=config.ingest.include_ground_truth,
+                allow_pdf=config.ingest.allow_pdf,
+                pdf_extractor=config.ingest.pdf_extractor,
+            )
+        ...
+        rag = LightRAG(
+            working_dir=working_dir,
+            llm_model_func=llm_model_func,
+            llm_model_name=config.openai.chat_model,
+            embedding_func=embedding_func,
+            max_parallel_insert=int(getattr(config, "max_parallel_insert", 2)),
+        )
+        loop.run_until_complete(rag.initialize_storages())
+        ...
+        rag.insert(docs, file_paths=file_paths, ids=doc_ids)
+      - Inputs: CLI args + CONFIG from wnc_scripts/openai_test_config.py (dataclass instance).
+      - Outputs: Calls into LightRAG indexing pipeline; returns none.
+      - Side effects (Files/cache touched): Creates/updates working_dir storages under rag_storage/... via later calls.
+      - Errors/edge cases:
+          - Exits if missing OPENAI_API_KEY when not in Azure mode (wnc_scripts/openai_test.py:181-183)
+          - Exits if kdb_dir missing or no docs produced (wnc_scripts/openai_test.py:214-240)
+  - ## 1.2 wnc_scripts/utils_test.py:load_mixed_docs
+      - Function/class name: load_mixed_docs
+      - Purpose: Walk kdb_dir, read .json/.txt/.md (+ optional .pdf) and build docs + file_paths.
+      - Trigger/Caller: main (wnc_scripts/openai_test.py:219)
+      - Code location(s): wnc_scripts/utils_test.py:315
+      - Code snippet (10–20 lines):
+
+        for path in sorted(kdb_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix == ".json":
+                sample = json.loads(path.read_text(encoding="utf-8"))
+                doc_text = sample_json_to_doc_text(sample, include_ground_truth)
+                docs.append(f"source_file: {path}\n{doc_text}")
+                file_paths.append(str(path))
+                continue
+            if suffix in {".txt", ".md"}:
+                text = path.read_text(encoding="utf-8", errors="ignore").strip()
+                docs.append(f"source_file: {path}\n{text}")
+                file_paths.append(str(path))
+                continue
+      - Inputs:
+          - kdb_dir: Path
+          - include_ground_truth: bool
+          - allow_pdf: bool
+          - pdf_extractor: str
+      - Outputs:
+          - Tuple[List[str], List[str]] where docs[i] corresponds to file_paths[i].
+      - Side effects (Files/cache touched): Reads files under kdb_dir; no rag_storage writes.
+      - Errors/edge cases: Skips unreadable/unsupported/empty files with warnings; does not raise for individual file failures (wnc_scripts/utils_test.py:336-378).
+  - ## 1.3 wnc_scripts/utils_test.py:sample_json_to_doc_text
+      - Function/class name: sample_json_to_doc_text
+      - Purpose: Convert one JSON “sample” dict into a compact text document (key fields + input_datas[*].content_raw).
+      - Trigger/Caller: load_mixed_docs (wnc_scripts/utils_test.py:345)
+      - Code location(s): wnc_scripts/utils_test.py:180
+      - Code snippet (10–20 lines):
+
+        for key in ("id", "tags", "task_types"):
+            if key in sample:
+                lines.append(f"{key}: {json_value_to_text(sample.get(key))}")
+
+        input_datas = sample.get("input_datas") or []
+        if isinstance(input_datas, list) and input_datas:
+            lines.append("input_datas:")
+            for idx, item in enumerate(input_datas, start=1):
+                filename = json_value_to_text(item.get("filename"))
+                timestamp = json_value_to_text(item.get("timestamp"))
+                content_raw = json_value_to_text(item.get("content_raw"))
+                lines.append(f"- item_{idx} filename={filename} timestamp={timestamp}")
+                if content_raw:
+                    lines.append(content_raw)
+      - Inputs: sample: dict, include_ground_truth: bool
+      - Outputs: str (multi-line doc text)
+      - Side effects: none
+      - Errors/edge cases: Skips non-dict input_datas items; may return empty string if no meaningful fields.
+  - ## 1.4 wnc_scripts/utils_test.py:json_value_to_text
+      - Function/class name: json_value_to_text
+      - Purpose: Normalize JSON values to string for embedding text.
+      - Trigger/Caller: sample_json_to_doc_text
+      - Code location(s): wnc_scripts/utils_test.py:170
+      - Code snippet (10–20 lines):
+
+        def json_value_to_text(value: object) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+      - Inputs: object
+      - Outputs: str
+      - Side effects: none
+      - Errors/edge cases: none (JSON-serializes non-strings)
+  - ## 2. Configure LightRAG + storages (Summary)
+      - Purpose: Provide LLM + embedding functions, construct LightRAG(...), and initialize in-memory storages bound to on-disk JSON/GraphML/VectorDB files.
+      - Functions involved (names + locations only):
+          - embedding_func (nested) — wnc_scripts/openai_test.py:302
+          - llm_model_func (nested) — wnc_scripts/openai_test.py:271
+          - LightRAG.__post_init__ — lightrag/lightrag.py:445
+          - LightRAG.initialize_storages — lightrag/lightrag.py:671
+          - LightRAG._get_storage_class (backend selection point) — lightrag/lightrag.py:1091
+      - Outputs/artifacts touched (high level):
+          - Prepares file paths for kv_store_*.json, vdb_*.json, graph_*.graphml in working_dir (actual writes happen on enqueue/process + _insert_done flush).
+  - ## 2.1 wnc_scripts/openai_test.py:llm_model_func (nested)
+      - Function/class name: llm_model_func
+      - Purpose: Provide the async chat-completion callable used by LightRAG (entity extraction, summarization, query-time).
+      - Trigger/Caller: Passed into LightRAG(..., llm_model_func=llm_model_func) (wnc_scripts/openai_test.py:330)
+      - Code location(s): wnc_scripts/openai_test.py:271
+      - Code snippet (10–20 lines):
+
+        async def llm_model_func(
+            prompt,
+            system_prompt=None,
+            history_messages=[],
+            keyword_extraction=False,
+            **kwargs,
+        ) -> str:
+            return await openai_complete_if_cache(
+                config.openai.chat_model,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                api_key=api_key,
+                base_url=config.openai.base_url,
+                timeout=config.openai.timeout,
+                use_azure=config.openai.use_azure,
+                azure_deployment=config.openai.azure_deployment,
+                api_version=config.openai.api_version,
+                keyword_extraction=keyword_extraction,
+                **kwargs,
+            )
+      - Inputs: prompt: str, system_prompt: str|None, history_messages: list[dict], etc.
+      - Outputs: str (LLM response text)
+      - Side effects: May hit provider network; may hit LLM cache inside openai_complete_if_cache (external to this repo).
+      - Errors/edge cases: Provider errors propagate up into indexing; failures cause doc status → FAILED later (lightrag/lightrag.py:1988-2008).
+  - ## 2.2 wnc_scripts/openai_test.py:embedding_func (nested)
+      - Function/class name: embedding_func
+      - Purpose: Provide the async embedding callable used by NanoVectorDB storages (chunks, entities, relationships).
+      - Trigger/Caller: Passed into LightRAG(..., embedding_func=embedding_func) (wnc_scripts/openai_test.py:332)
+      - Code location(s): wnc_scripts/openai_test.py:302
+      - Code snippet (10–20 lines):
+
+        @wrap_embedding_func_with_attrs(
+            embedding_dim=config.openai.embed_dim,
+            max_token_size=8192,
+            model_name=config.openai.embed_model,
+            send_dimensions=True,
+        )
+        async def embedding_func(
+            texts: list[str],
+            embedding_dim: int | None = None,
+            max_token_size: int | None = None,
+        ) -> np.ndarray:
+            client_configs = (
+                {"timeout": config.openai.timeout} if config.openai.timeout is not None else None
+            )
+            return await openai_embed.func(
+                texts,
+                model=config.openai.embed_model,
+                api_key=api_key,
+                base_url=config.openai.base_url,
+                embedding_dim=embedding_dim,
+                max_token_size=max_token_size,
+                client_configs=client_configs,
+                use_azure=config.openai.use_azure,
+                azure_deployment=config.openai.azure_deployment,
+                api_version=config.openai.api_version,
+            )
+      - Inputs: texts: list[str]
+      - Outputs: np.ndarray shape [len(texts), embed_dim]
+      - Side effects: Provider calls (unless cached by provider layer); errors propagate into indexing and can cause doc status → FAILED.
+  - ## 2.3 lightrag/lightrag.py:LightRAG.__post_init__
+      - Function/class name: LightRAG.__post_init__
+      - Purpose: Validate config, wrap embedding func with concurrency limits, and instantiate storages (JsonKVStorage, NanoVectorDBStorage, NetworkXStorage,
+        JsonDocStatusStorage).
+      - Trigger/Caller: Dataclass post-init when rag = LightRAG(...) is constructed (wnc_scripts/openai_test.py:328)
+      - Code location(s): lightrag/lightrag.py:445
+      - Code snippet (10–20 lines):
+
+        self.key_string_value_json_storage_cls = self._get_storage_class(self.kv_storage)
+        self.vector_db_storage_cls = self._get_storage_class(self.vector_storage)
+        self.graph_storage_cls = self._get_storage_class(self.graph_storage)
+        self.key_string_value_json_storage_cls = partial(self.key_string_value_json_storage_cls, global_config=global_config)
+        self.vector_db_storage_cls = partial(self.vector_db_storage_cls, global_config=global_config)
+        self.graph_storage_cls = partial(self.graph_storage_cls, global_config=global_config)
+
+        self.llm_response_cache = self.key_string_value_json_storage_cls(
+            namespace=NameSpace.KV_STORE_LLM_RESPONSE_CACHE,
+            workspace=self.workspace,
+            global_config=global_config,
+            embedding_func=self.embedding_func,
+        )
+        self.text_chunks = self.key_string_value_json_storage_cls(
+            namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
+            workspace=self.workspace,
+            embedding_func=self.embedding_func,
+        )
+      - Inputs: LightRAG(...) fields (working_dir, storage backend names, funcs, limits).
+      - Outputs: Fully constructed LightRAG instance with storage objects attached.
+      - Side effects: Creates working_dir if missing (lightrag/lightrag.py:472-475); does not persist index data yet.
+      - Errors/edge cases:
+          - Storage backend name compatibility checked (verify_storage_implementation) and env vars required (check_storage_env_vars) (lightrag/lightrag.py:476-489)
+          - NanoVectorDB requires cosine_better_than_threshold in kwargs (injected by LightRAG at lightrag/lightrag.py:490-495)
+  - ## 2.4 lightrag/lightrag.py:LightRAG._get_storage_class
+      - Function/class name: LightRAG._get_storage_class
+      - Purpose: Storage-backend selection point (default file-based vs Redis/PG/Mongo/Milvus/etc).
+      - Trigger/Caller: LightRAG.__post_init__ when building storages.
+      - Code location(s): lightrag/lightrag.py:1091
+      - Code snippet (10–20 lines):
+
+        def _get_storage_class(self, storage_name: str) -> Callable[..., Any]:
+            if storage_name == "JsonKVStorage":
+                from lightrag.kg.json_kv_impl import JsonKVStorage
+                return JsonKVStorage
+            elif storage_name == "NanoVectorDBStorage":
+                from lightrag.kg.nano_vector_db_impl import NanoVectorDBStorage
+                return NanoVectorDBStorage
+            elif storage_name == "NetworkXStorage":
+                from lightrag.kg.networkx_impl import NetworkXStorage
+                return NetworkXStorage
+            elif storage_name == "JsonDocStatusStorage":
+                from lightrag.kg.json_doc_status_impl import JsonDocStatusStorage
+                return JsonDocStatusStorage
+            else:
+                import_path = STORAGES[storage_name]
+                storage_class = lazy_external_import(import_path, storage_name)
+                return storage_class
+      - Inputs: storage_name: str
+      - Outputs: Storage class constructor
+      - Side effects: Imports backend modules; determines where alternative backends plug in (via STORAGES in lightrag/kg/__init__.py:97).
+      - Errors/edge cases: KeyError if unknown storage name not present in STORAGES.
+  - ## 2.5 lightrag/lightrag.py:LightRAG.initialize_storages
+      - Function/class name: LightRAG.initialize_storages
+      - Purpose: Initialize all storages (load existing JSON/vdb/graph files into shared memory; set pipeline status for workspace).
+      - Trigger/Caller: openai_test.py (wnc_scripts/openai_test.py:340)
+      - Code location(s): lightrag/lightrag.py:671
+      - Code snippet (10–20 lines):
+
+        async def initialize_storages(self):
+            if self._storages_status == StoragesStatus.CREATED:
+                from lightrag.kg.shared_storage import initialize_pipeline_status
+                await initialize_pipeline_status(workspace=self.workspace)
+
+                for storage in (
+                    self.full_docs, self.text_chunks, self.full_entities, self.full_relations,
+                    self.entity_chunks, self.relation_chunks, self.entities_vdb,
+                    self.relationships_vdb, self.chunks_vdb, self.chunk_entity_relation_graph,
+                    self.llm_response_cache, self.doc_status,
+                ):
+                    if storage:
+                        await storage.initialize()
+                self._storages_status = StoragesStatus.INITIALIZED
+      - Inputs: none (uses self.* storages)
+      - Outputs: none
+      - Side effects: Loads on-disk artifacts (if present) into storage memory; prepares shared pipeline_status namespace.
+      - Errors/edge cases: If skipped, later operations may raise initialization-related errors.
+  - ## 3. Insert kickoff (Summary)
+      - Purpose: Convert docs into doc IDs, call rag.insert(...), generate track_id, enqueue docs as PENDING.
+      - Functions involved (names + locations only):
+          - compute_mdhash_id — lightrag/utils.py:581 (also used in script at wnc_scripts/openai_test.py:393)
+          - LightRAG.insert — lightrag/lightrag.py:1115
+          - LightRAG.ainsert — lightrag/lightrag.py:1151
+          - generate_track_id — lightrag/utils.py:2993
+          - LightRAG.apipeline_enqueue_documents — lightrag/lightrag.py:1270
+      - Outputs/artifacts touched (high level): kv_store_full_docs.json and kv_store_doc_status.json are created/updated during enqueue.
+  - ## 3.1 lightrag/utils.py:compute_mdhash_id
+      - Function/class name: compute_mdhash_id
+      - Purpose: Deterministic ID generation for docs/chunks/entities/relations via MD5 hash + prefix.
+      - Trigger/Caller:
+          - wnc_scripts/openai_test.py uses it for doc IDs (wnc_scripts/openai_test.py:393)
+          - LightRAG uses it for chunk IDs (lightrag/lightrag.py:1858), entity IDs (lightrag/operate.py:1851), relation IDs (lightrag/operate.py:2367)
+      - Code location(s): lightrag/utils.py:581
+      - Code snippet (10–20 lines):
+
+        def compute_mdhash_id(content: str, prefix: str = "") -> str:
+            """
+            Compute a unique ID for a given content string.
+            The ID is a combination of the given prefix and the MD5 hash of the content string.
+            """
+            return prefix + compute_args_hash(content)
+      - Inputs: content: str, prefix: str
+      - Outputs: str like "doc-<md5>", "chunk-<md5>", "ent-<md5>", "rel-<md5>"
+      - Side effects: none
+      - Errors/edge cases: depends on compute_args_hash safe unicode handling.
+  - ## 3.2 lightrag/lightrag.py:LightRAG.insert
+      - Function/class name: LightRAG.insert
+      - Purpose: Sync wrapper that runs ainsert in an event loop.
+      - Trigger/Caller: wnc_scripts/openai_test.py:396
+      - Code location(s): lightrag/lightrag.py:1115
+      - Code snippet (10–20 lines): (see entrypoint snippet in 0. Entry points)
+      - Inputs:
+          - input: str | list[str] (here: list[str])
+          - ids: list[str] (here: doc_ids from script)
+          - file_paths: list[str]
+      - Outputs: track_id: str
+      - Side effects: Starts async enqueue + processing pipeline
+      - Errors/edge cases: Propagates exceptions raised inside ainsert.
+  - ## 3.3 lightrag/lightrag.py:LightRAG.ainsert
+      - Function/class name: LightRAG.ainsert
+      - Purpose: Generate track_id (if missing), enqueue docs, then process queued docs.
+      - Trigger/Caller: LightRAG.insert
+      - Code location(s): lightrag/lightrag.py:1151
+      - Code snippet (10–20 lines):
+
+        async def ainsert(..., track_id: str | None = None) -> str:
+            if track_id is None:
+                track_id = generate_track_id("insert")
+
+            logger.info(format_stage_provider_requirements(
+                stage="Indexing",
+                llm_requirement="required",
+                embedding_requirement="required",
+                llm_model_func=self.llm_model_func,
+                embedding_func=self.embedding_func,
+                note="LLM/embedding calls may be satisfied by cache; internet depends on provider backend",
+            ))
+
+            await self.apipeline_enqueue_documents(input, ids, file_paths, track_id)
+            await self.apipeline_process_enqueue_documents(
+                split_by_character, split_by_character_only
+            )
+            return track_id
+      - Inputs: docs + ids + file_paths
+      - Outputs: track_id: str (stored into doc_status entries)
+      - Side effects: Kicks off status writes + vector db writes + graph writes downstream.
+      - Errors/edge cases: If enqueue finds no new docs, it returns early from enqueue (warns) and processing still runs but may find nothing to process.
+  - ## 3.4 lightrag/utils.py:generate_track_id
+      - Function/class name: generate_track_id
+      - Purpose: Create unique tracking IDs stored on doc status entries.
+      - Trigger/Caller: LightRAG.ainsert (lightrag/lightrag.py:1177)
+      - Code location(s): lightrag/utils.py:2993
+      - Code snippet (10–20 lines):
+
+        def generate_track_id(prefix: str = "upload") -> str:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            return f"{prefix}_{timestamp}_{unique_id}"
+      - Inputs: prefix: str ("insert" here)
+      - Outputs: str like insert_20260121_123456_deadbeef
+      - Side effects: none
+      - Errors/edge cases: none
+  - ## 4. Enqueue docs + write initial status (Summary)
+      - Purpose: Normalize inputs, sanitize content, dedupe, write full_docs and set doc statuses to PENDING.
+      - Functions involved (names + locations only):
+          - LightRAG.apipeline_enqueue_documents — lightrag/lightrag.py:1270
+          - sanitize_text_for_encoding — lightrag/utils.py:2279
+          - get_content_summary — lightrag/utils.py:2108
+          - JsonKVStorage.upsert — lightrag/kg/json_kv_impl.py:149 (method continues beyond shown snippet)
+          - JsonKVStorage.index_done_callback — lightrag/kg/json_kv_impl.py:77
+          - JsonDocStatusStorage.upsert — lightrag/kg/json_doc_status_impl.py:186
+      - Outputs/artifacts touched (high level):
+          - kv_store_full_docs.json written immediately
+          - kv_store_doc_status.json written immediately (doc_status upsert calls index_done_callback)
+  - ## 4.1 lightrag/lightrag.py:LightRAG.apipeline_enqueue_documents
+      - Function/class name: LightRAG.apipeline_enqueue_documents
+      - Purpose: Build contents mapping (doc_id → content/file_path), create initial status docs (PENDING), filter out already-enqueued IDs, persist to full_docs and
+        doc_status.
+      - Trigger/Caller: LightRAG.ainsert (lightrag/lightrag.py:1191)
+      - Code location(s): lightrag/lightrag.py:1270
+      - Code snippet (10–20 lines):
+
+        # 2. Generate document initial status (without content)
+        new_docs = {
+            id_: {
+                "status": DocStatus.PENDING,
+                "content_summary": get_content_summary(content_data["content"]),
+                "content_length": len(content_data["content"]),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "file_path": content_data["file_path"],
+                "track_id": track_id,
+            }
+            for id_, content_data in contents.items()
+        }
+
+        unique_new_doc_ids = await self.doc_status.filter_keys(all_new_doc_ids)
+        ...
+        await self.full_docs.upsert(full_docs_data)
+        await self.full_docs.index_done_callback()
+        await self.doc_status.upsert(new_docs)
+      - Inputs:
+          - input: list[str] (docs)
+          - ids: list[str] (doc IDs from script)
+          - file_paths: list[str]
+          - track_id: str
+      - Outputs: track_id: str
+      - Side effects (Files/cache touched):
+          - NameSpace.KV_STORE_FULL_DOCS → kv_store_full_docs.json
+          - NameSpace.DOC_STATUS → kv_store_doc_status.json
+      - Errors/edge cases:
+          - Raises if len(file_paths) != len(input) when file_paths provided (lightrag/lightrag.py:1305-1311)
+          - Raises if ids length mismatch or non-unique (lightrag/lightrag.py:1318-1325)
+          - Dedupes by sanitized content: later duplicates are dropped (lightrag/lightrag.py:1326-1337), which can drop some provided IDs.
+  - ## 4.2 lightrag/utils.py:sanitize_text_for_encoding
+      - Function/class name: sanitize_text_for_encoding
+      - Purpose: Remove/replace problematic Unicode (surrogates/control chars) to prevent downstream UTF-8 failures (used for docs + prompts).
+      - Trigger/Caller:
+          - LightRAG.apipeline_enqueue_documents sanitizes docs before dedupe (lightrag/lightrag.py:1329, lightrag/lightrag.py:1342)
+          - use_llm_func_with_cache sanitizes prompts (lightrag/utils.py:2001)
+      - Code location(s): lightrag/utils.py:2279
+      - Code snippet (10–20 lines):
+
+        def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
+            if not text:
+                return text
+            text = text.strip()
+            if not text:
+                return text
+            text.encode("utf-8")
+            sanitized = ""
+            for char in text:
+                code_point = ord(char)
+                if 0xD800 <= code_point <= 0xDFFF:
+                    sanitized += replacement_char
+                    continue
+                elif code_point == 0xFFFE or code_point == 0xFFFF:
+                    sanitized += replacement_char
+                    continue
+                else:
+                    sanitized += char
+            sanitized = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", replacement_char, sanitized)
+            return sanitized
+      - Inputs: text: str
+      - Outputs: sanitized str
+      - Side effects: none
+      - Errors/edge cases: Can raise ValueError per docstring; upstream catches some failures in extraction code paths.
+  - ## 4.3 lightrag/utils.py:get_content_summary
+      - Function/class name: get_content_summary
+      - Purpose: Store a short preview of doc content into doc_status entries.
+      - Trigger/Caller: LightRAG.apipeline_enqueue_documents (lightrag/lightrag.py:1359)
+      - Code location(s): lightrag/utils.py:2108
+      - Code snippet (10–20 lines):
+
+        def get_content_summary(content: str, max_length: int = 250) -> str:
+            content = content.strip()
+            if len(content) <= max_length:
+                return content
+            return content[:max_length] + "..."
+      - Inputs: content: str
+      - Outputs: str preview
+      - Side effects: none
+      - Errors/edge cases: none
+  - ## 5. Chunking + chunk KV + chunk embeddings (Summary)
+      - Purpose: Pull PENDING/FAILED/PROCESSING docs from doc_status, chunk docs, write:
+          - doc_status → PROCESSING with chunk list
+          - text_chunks KV
+          - chunks vector embeddings (vdb_chunks.json)
+      - Functions involved (names + locations only):
+          - LightRAG.apipeline_process_enqueue_documents — lightrag/lightrag.py:1618
+          - LightRAG.apipeline_process_enqueue_documents.<locals>.process_document — lightrag/lightrag.py:1756
+          - chunking_by_token_size — lightrag/operate.py:100 (default via LightRAG.chunking_func)
+          - NanoVectorDBStorage.upsert — lightrag/kg/nano_vector_db_impl.py:96
+          - JsonKVStorage.upsert — lightrag/kg/json_kv_impl.py:149
+          - JsonDocStatusStorage.upsert — lightrag/kg/json_doc_status_impl.py:186
+      - Outputs/artifacts touched (high level):
+          - kv_store_text_chunks.json, vdb_chunks.json, kv_store_doc_status.json
+  - ## 5.1 lightrag/lightrag.py:LightRAG.apipeline_process_enqueue_documents
+      - Function/class name: LightRAG.apipeline_process_enqueue_documents
+      - Purpose: Single-worker queue processor: collects docs, runs process_document concurrently (bounded), and manages shared pipeline_status.
+      - Trigger/Caller: LightRAG.ainsert (lightrag/lightrag.py:1192)
+      - Code location(s): lightrag/lightrag.py:1618
+      - Code snippet (10–20 lines):
+
+        processing_docs, failed_docs, pending_docs = await asyncio.gather(
+            self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
+            self.doc_status.get_docs_by_status(DocStatus.FAILED),
+            self.doc_status.get_docs_by_status(DocStatus.PENDING),
+        )
+        to_process_docs = {}
+        to_process_docs.update(processing_docs)
+        to_process_docs.update(failed_docs)
+        to_process_docs.update(pending_docs)
+        ...
+        for doc_id, status_doc in to_process_docs.items():
+            doc_tasks.append(process_document(
+                doc_id, status_doc, split_by_character, split_by_character_only,
+                pipeline_status, pipeline_status_lock, semaphore,
+            ))
+        await asyncio.gather(*doc_tasks)
+      - Inputs: split_by_character, split_by_character_only
+      - Outputs: none
+      - Side effects: Updates pipeline_status shared namespace; schedules per-doc chunking/embedding/extraction/merge.
+      - Errors/edge cases: If another process is busy, sets request_pending and returns (lightrag/lightrag.py:1677-1683).
+  - ## 5.2 lightrag/lightrag.py:LightRAG.apipeline_process_enqueue_documents.<locals>.process_document
+      - Function/class name: process_document (nested)
+      - Purpose: For one doc_id: chunk, set status PROCESSING, write chunk KV + chunk embeddings, run entity extraction + merge, set status PROCESSED/FAILED, flush
+        storages.
+      - Trigger/Caller: LightRAG.apipeline_process_enqueue_documents (lightrag/lightrag.py:2139)
+      - Code location(s): lightrag/lightrag.py:1756
+      - Code snippet (10–20 lines):
+
+        chunking_result = self.chunking_func(
+            self.tokenizer, content, split_by_character, split_by_character_only,
+            self.chunk_overlap_token_size, self.chunk_token_size,
+        )
+        if inspect.isawaitable(chunking_result):
+            chunking_result = await chunking_result
+        chunks = {
+            compute_mdhash_id(dp["content"], prefix="chunk-"): {
+                **dp, "full_doc_id": doc_id, "file_path": file_path, "llm_cache_list": [],
+            }
+            for dp in chunking_result
+        }
+
+        doc_status_task = asyncio.create_task(self.doc_status.upsert({doc_id: {"status": DocStatus.PROCESSING, "chunks_list": list(chunks.keys()), ...}}))
+        chunks_vdb_task = asyncio.create_task(self.chunks_vdb.upsert(chunks))
+        text_chunks_task = asyncio.create_task(self.text_chunks.upsert(chunks))
+        await asyncio.gather(doc_status_task, chunks_vdb_task, text_chunks_task)
+      - Inputs:
+          - doc_id: str
+          - status_doc: DocProcessingStatus
+      - Outputs: none (but passes chunk_results into merge stage)
+      - Side effects (Files/cache touched):
+          - doc_status (kv_store_doc_status.json): PENDING → PROCESSING → PROCESSED/FAILED
+          - text_chunks (kv_store_text_chunks.json)
+          - chunks_vdb (vdb_chunks.json)
+      - Errors/edge cases:
+          - Chunking function must return list/tuple; else TypeError (lightrag/lightrag.py:1849-1854)
+          - Any failure updates doc_status → FAILED (lightrag/lightrag.py:1988-2008)
+  - ## 5.3 lightrag/operate.py:chunking_by_token_size
+      - Function/class name: chunking_by_token_size
+      - Purpose: Default chunker: token-window splitting with overlap; optional character pre-split.
+      - Trigger/Caller: process_document via self.chunking_func default (lightrag/lightrag.py:252)
+      - Code location(s): lightrag/operate.py:100
+      - Code snippet (10–20 lines):
+
+        def chunking_by_token_size(tokenizer, content, split_by_character=None, split_by_character_only=False,
+                                  chunk_overlap_token_size=100, chunk_token_size=1200):
+            tokens = tokenizer.encode(content)
+            results = []
+            if split_by_character:
+                raw_chunks = content.split(split_by_character)
+                ...
+            else:
+                for index, start in enumerate(
+                    range(0, len(tokens), chunk_token_size - chunk_overlap_token_size)
+                ):
+                    chunk_content = tokenizer.decode(tokens[start : start + chunk_token_size])
+                    results.append(
+                        {"tokens": min(chunk_token_size, len(tokens) - start),
+                         "content": chunk_content.strip(), "chunk_order_index": index}
+                    )
+            return results
+      - Inputs: tokenizer + content + limits
+      - Outputs: list[{"tokens": int, "content": str, "chunk_order_index": int}]
+      - Side effects: none
+      - Errors/edge cases: Can raise ChunkTokenLimitExceededError when split_by_character_only=True and one split chunk exceeds limit (lightrag/operate.py:117-126).
+  - ## 5.4 lightrag/kg/nano_vector_db_impl.py:NanoVectorDBStorage.upsert
+      - Function/class name: NanoVectorDBStorage.upsert
+      - Purpose: Compute embeddings for each content, attach compressed vectors, and upsert into NanoVectorDB in-memory storage (persisted later).
+      - Trigger/Caller: process_document (lightrag/lightrag.py:1916-1918) for chunks; merge stage for entities/relations.
+      - Code location(s): lightrag/kg/nano_vector_db_impl.py:96
+      - Code snippet (10–20 lines):
+
+        contents = [v["content"] for v in data.values()]
+        batches = [contents[i : i + self._max_batch_size] for i in range(0, len(contents), self._max_batch_size)]
+        embedding_tasks = [self.embedding_func(batch) for batch in batches]
+        embeddings_list = await asyncio.gather(*embedding_tasks)
+        embeddings = np.concatenate(embeddings_list)
+
+        if len(embeddings) == len(list_data):
+            for i, d in enumerate(list_data):
+                vector_f16 = embeddings[i].astype(np.float16)
+                compressed_vector = zlib.compress(vector_f16.tobytes())
+                encoded_vector = base64.b64encode(compressed_vector).decode("utf-8")
+                d["vector"] = encoded_vector
+                d["__vector__"] = embeddings[i]
+            client = await self._get_client()
+            results = client.upsert(datas=list_data)
+            return results
+      - Inputs: data: dict[id -> {"content": str, ...meta_fields}]
+      - Outputs: NanoVectorDB upsert result (ignored by callers)
+      - Side effects (Files/cache touched): In-memory NanoVectorDB state; persisted to vdb_<namespace>.json on index_done_callback.
+      - Errors/edge cases:
+          - If embeddings count mismatches items, logs error and returns without upsert (lightrag/kg/nano_vector_db_impl.py:139-142).
+  - ## 6. Entity/relation extraction + LLM cache (Summary)
+      - Purpose: For each chunk: call LLM extraction (cached), parse entities/relations, and record cache keys back onto chunk KV (llm_cache_list).
+      - Functions involved (names + locations only):
+          - LightRAG._process_extract_entities — lightrag/lightrag.py:2205
+          - extract_entities — lightrag/operate.py:2788
+          - extract_entities.<locals>._process_single_content — lightrag/operate.py:2836
+          - _process_extraction_result — lightrag/operate.py:911
+          - _handle_single_entity_extraction — lightrag/operate.py:380
+          - _handle_single_relationship_extraction — lightrag/operate.py:452
+          - use_llm_func_with_cache — lightrag/utils.py:1966
+          - handle_cache — lightrag/utils.py:1405
+          - save_to_cache — lightrag/utils.py:1451
+          - update_chunk_cache_list — lightrag/utils.py:1916
+      - Outputs/artifacts touched (high level):
+          - kv_store_llm_response_cache.json (LLM cache)
+          - kv_store_text_chunks.json updated with llm_cache_list
+  - ## 6.1 lightrag/lightrag.py:LightRAG._process_extract_entities
+      - Function/class name: LightRAG._process_extract_entities
+      - Purpose: Wrapper around extract_entities(...) with pipeline_status updates.
+      - Trigger/Caller: process_document stage 2 (lightrag/lightrag.py:1935-1941)
+      - Code location(s): lightrag/lightrag.py:2205
+      - Code snippet (10–20 lines):
+
+        async def _process_extract_entities(self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None) -> list:
+            try:
+                chunk_results = await extract_entities(
+                    chunk,
+                    global_config=asdict(self),
+                    pipeline_status=pipeline_status,
+                    pipeline_status_lock=pipeline_status_lock,
+                    llm_response_cache=self.llm_response_cache,
+                    text_chunks_storage=self.text_chunks,
+                )
+                return chunk_results
+            except Exception as e:
+                error_msg = f"Failed to extract entities and relationships: {str(e)}"
+                logger.error(error_msg)
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = error_msg
+                    pipeline_status["history_messages"].append(error_msg)
+                raise e
+      - Inputs: chunk: dict[str, Any] (the chunk dict keyed by chunk_id)
+      - Outputs: list of (maybe_nodes, maybe_edges) per chunk
+      - Side effects: Updates pipeline_status; forwards llm_response_cache + text_chunks storage into extraction.
+      - Errors/edge cases: Reraises, causing doc status → FAILED.
+  - ## 6.2 lightrag/operate.py:extract_entities
+      - Function/class name: extract_entities
+      - Purpose: Run chunk-parallel entity extraction via LLM, parse outputs, return chunk_results for merge stage.
+      - Trigger/Caller: LightRAG._process_extract_entities
+      - Code location(s): lightrag/operate.py:2788
+      - Code snippet (10–20 lines):
+
+        use_llm_func: callable = global_config["llm_model_func"]
+        entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
+        ordered_chunks = list(chunks.items())
+        ...
+        async def _process_single_content(chunk_key_dp: tuple[str, TextChunkSchema]):
+            chunk_key = chunk_key_dp[0]
+            chunk_dp = chunk_key_dp[1]
+            content = chunk_dp["content"]
+            file_path = chunk_dp.get("file_path", "unknown_source")
+            cache_keys_collector = []
+            final_result, timestamp = await use_llm_func_with_cache(
+                entity_extraction_user_prompt,
+                use_llm_func,
+                system_prompt=entity_extraction_system_prompt,
+                llm_response_cache=llm_response_cache,
+                cache_type="extract",
+                chunk_id=chunk_key,
+                cache_keys_collector=cache_keys_collector,
+            )
+      - Inputs: chunks: dict[chunk_id -> chunk_schema], global_config: dict, optional cache + text_chunks_storage
+      - Outputs: list[(maybe_nodes, maybe_edges)] (one per processed chunk)
+      - Side effects:
+          - Writes LLM cache entries into llm_response_cache storage (if enabled; it is enabled by default in lightrag/lightrag.py:369)
+          - Updates text_chunks entries’ llm_cache_list via update_chunk_cache_list
+      - Errors/edge cases: On first exception, cancels remaining chunk tasks and raises a prefixed exception (lightrag/operate.py:2995-3028).
+  - ## 6.3 lightrag/utils.py:use_llm_func_with_cache
+      - Function/class name: use_llm_func_with_cache
+      - Purpose: Sanitize prompts, check cache, call LLM on miss, and save results into kv_store_llm_response_cache.json.
+      - Trigger/Caller:
+          - Entity extraction (lightrag/operate.py:2867)
+          - Entity/relation summarization (lightrag/operate.py:357, lightrag/operate.py:357)
+      - Code location(s): lightrag/utils.py:1966
+      - Code snippet (10–20 lines):
+
+        safe_user_prompt = sanitize_text_for_encoding(user_prompt)
+        safe_system_prompt = sanitize_text_for_encoding(system_prompt) if system_prompt else None
+        ...
+        arg_hash = compute_args_hash(_prompt)
+        cache_key = generate_cache_key("default", cache_type, arg_hash)
+
+        cached_result = await handle_cache(
+            llm_response_cache,
+            arg_hash,
+            _prompt,
+            "default",
+            cache_type=cache_type,
+        )
+        if cached_result:
+            content, timestamp = cached_result
+            if cache_keys_collector is not None:
+                cache_keys_collector.append(cache_key)
+            return content, timestamp
+        res: str = await use_llm_func(safe_user_prompt, system_prompt=safe_system_prompt, **kwargs)
+      - Inputs: user_prompt: str, use_llm_func: callable, llm_response_cache: BaseKVStorage|None, cache_type: str, chunk_id: str|None
+      - Outputs: (content: str, timestamp: int)
+      - Side effects (Files/cache touched):
+          - NameSpace.KV_STORE_LLM_RESPONSE_CACHE → kv_store_llm_response_cache.json (via save_to_cache → JsonKVStorage.upsert)
+      - Errors/edge cases: Wraps uncached LLM exceptions with [LLM func] prefix when cache is disabled (lightrag/utils.py:2093-2101).
+  - ## 7. Graph + entity/relation VectorDB merge (Summary)
+      - Purpose: Consolidate extracted nodes/edges across chunks, update:
+          - graph (graph_chunk_entity_relation.graphml)
+          - entities VDB (vdb_entities.json)
+          - relationships VDB (vdb_relationships.json)
+          - doc-level indexes (kv_store_full_entities.json, kv_store_full_relations.json)
+          - per-entity/per-relation chunk tracking (kv_store_entity_chunks.json, kv_store_relation_chunks.json)
+      - Functions involved (names + locations only):
+          - merge_nodes_and_edges — lightrag/operate.py:2399
+          - merge_nodes_and_edges.<locals>._locked_process_entity_name — lightrag/operate.py:2502
+          - _merge_nodes_then_upsert — lightrag/operate.py:1594
+          - merge_nodes_and_edges.<locals>._locked_process_edges — lightrag/operate.py:2603
+          - _merge_edges_then_upsert — lightrag/operate.py:1872
+          - _handle_entity_relation_summary — lightrag/operate.py:166
+          - _summarize_descriptions — lightrag/operate.py:298
+          - safe_vdb_operation_with_exception — lightrag/utils.py:162
+      - Outputs/artifacts touched (high level): graphml + vdb + kv stores listed above.
+  - ## 7.1 lightrag/operate.py:merge_nodes_and_edges
+      - Function/class name: merge_nodes_and_edges
+      - Purpose: Two-phase merge: (1) entities, (2) relations, (3) write doc-level entity/relation indexes.
+      - Trigger/Caller: process_document after extraction succeeds (lightrag/lightrag.py:2023-2040)
+      - Code location(s): lightrag/operate.py:2399
+      - Code snippet (10–20 lines):
+
+        all_nodes = defaultdict(list)
+        all_edges = defaultdict(list)
+        for maybe_nodes, maybe_edges in chunk_results:
+            for entity_name, entities in maybe_nodes.items():
+                all_nodes[entity_name].extend(entities)
+            for edge_key, edges in maybe_edges.items():
+                sorted_edge_key = tuple(sorted(edge_key))
+                all_edges[sorted_edge_key].extend(edges)
+
+        for entity_name, entities in all_nodes.items():
+            task = asyncio.create_task(_locked_process_entity_name(entity_name, entities))
+            entity_tasks.append(task)
+
+        for edge_key, edges in all_edges.items():
+            task = asyncio.create_task(_locked_process_edges(edge_key, edges))
+            edge_tasks.append(task)
+      - Inputs:
+          - chunk_results: list[(maybe_nodes, maybe_edges)]
+          - knowledge_graph_inst: BaseGraphStorage (NetworkX)
+          - entity_vdb, relationships_vdb (NanoVectorDB)
+          - storages: full_entities_storage, full_relations_storage, entity_chunks_storage, relation_chunks_storage
+          - doc_id: str, file_path: str
+      - Outputs: none
+      - Side effects: Writes graph/vdb/kv updates (persisted on _insert_done).
+      - Errors/edge cases: If any entity/relation merge task fails, first exception aborts merge and bubbles up; doc status becomes FAILED.
+  - ## 8. Persistence flush / “close” semantics (Summary)
+      - Purpose: Flush all in-memory storages to disk after each successfully processed document.
+      - Functions involved (names + locations only):
+          - LightRAG._insert_done — lightrag/lightrag.py:2226
+          - JsonKVStorage.index_done_callback — lightrag/kg/json_kv_impl.py:77
+          - JsonDocStatusStorage.index_done_callback — lightrag/kg/json_doc_status_impl.py:161
+          - NanoVectorDBStorage.index_done_callback — lightrag/kg/nano_vector_db_impl.py:273
+          - NetworkXStorage.index_done_callback — lightrag/kg/networkx_impl.py:503
+      - Outputs/artifacts touched (high level): all persisted artifacts under working_dir.
+  - ## 8.1 lightrag/lightrag.py:LightRAG._insert_done
+      - Function/class name: LightRAG._insert_done
+      - Purpose: Call index_done_callback() on every storage (KV + doc_status + vdb + graph) to persist to disk.
+      - Trigger/Caller:
+          - After each PROCESSED doc (lightrag/lightrag.py:2067-2069)
+          - In insert_custom_chunks finalize path (lightrag/lightrag.py:1267-1269)
+      - Code location(s): lightrag/lightrag.py:2226
+      - Code snippet (10–20 lines):
+
+        tasks = [
+            cast(StorageNameSpace, storage_inst).index_done_callback()
+            for storage_inst in [
+                self.full_docs, self.doc_status, self.text_chunks,
+                self.full_entities, self.full_relations,
+                self.entity_chunks, self.relation_chunks,
+                self.llm_response_cache,
+                self.entities_vdb, self.relationships_vdb, self.chunks_vdb,
+                self.chunk_entity_relation_graph,
+            ]
+            if storage_inst is not None
+        ]
+        await asyncio.gather(*tasks)
+        logger.info("In memory DB persist to disk")
+      - Inputs: none
+      - Outputs: none
+      - Side effects: Forces writes of kv_store_*.json, vdb_*.json, graph_*.graphml.
+      - Errors/edge cases: If any index_done_callback fails, exception propagates to caller unless swallowed inside storage implementations.
+
+  # Final persisted artifacts
+
+  - graph_chunk_entity_relation.graphml
+      - Written by:
+          - NetworkXStorage.index_done_callback — lightrag/kg/networkx_impl.py:503
+          - Called by LightRAG._insert_done — lightrag/lightrag.py:2226
+      - Snippet (writer):
+
+        async def index_done_callback(self) -> bool:
+            async with self._storage_lock:
+                if self.storage_updated.value:
+                    self._graph = NetworkXStorage.load_nx_graph(self._graphml_xml_file) or nx.Graph()
+                    self.storage_updated.value = False
+                    return False
+            async with self._storage_lock:
+                NetworkXStorage.write_nx_graph(self._graph, self._graphml_xml_file, self.workspace)
+                await set_all_update_flags(self.namespace, workspace=self.workspace)
+                self.storage_updated.value = False
+                return True
+      - Data it contains: GraphML for the KG; nodes are entity IDs, edges are relations; edge/node attributes include source_id, file_path, description, keywords,
+        weight, created_at, etc (populated by _merge_nodes_then_upsert / _merge_edges_then_upsert).
+      - Flush timing: via _insert_done after each processed doc (lightrag/lightrag.py:2067-2069).
+  - kv_store_full_docs.json
+      - Written by:
+          - JsonKVStorage.index_done_callback — lightrag/kg/json_kv_impl.py:77
+          - Triggered immediately during enqueue: LightRAG.apipeline_enqueue_documents — lightrag/lightrag.py:1412
+      - Snippet (immediate flush):
+
+        await self.full_docs.upsert(full_docs_data)
+        await self.full_docs.index_done_callback()
+      - Data it contains (shape): {doc_id: {"content": str, "file_path": str, "_id": doc_id, "create_time": int, "update_time": int}}
+      - Flush timing: immediate at enqueue + again during _insert_done.
+  - kv_store_text_chunks.json
+      - Written by:
+          - JsonKVStorage.upsert (in-memory) — lightrag/kg/json_kv_impl.py:149
+          - Persisted by JsonKVStorage.index_done_callback — lightrag/kg/json_kv_impl.py:77
+          - Called by _insert_done — lightrag/lightrag.py:2226
+      - Snippet (chunk write + later cache-key augmentation):
+
+        text_chunks_task = asyncio.create_task(self.text_chunks.upsert(chunks))
+        ...
+        await update_chunk_cache_list(chunk_key, text_chunks_storage, cache_keys_collector, "entity_extraction")
+      - Data it contains (shape): {chunk_id: {"tokens": int, "content": str, "chunk_order_index": int, "full_doc_id": str, "file_path": str, "llm_cache_list":
+        [cache_key...], "_id": chunk_id, "create_time": int, "update_time": int}}
+      - Flush timing: via _insert_done after each processed doc.
+  - kv_store_doc_status.json
+      - Written by:
+          - JsonDocStatusStorage.upsert (includes immediate index_done_callback) — lightrag/kg/json_doc_status_impl.py:186
+          - Called at:
+              - enqueue: PENDING (lightrag/lightrag.py:1358-1367, lightrag/lightrag.py:1415)
+              - processing start: PROCESSING (lightrag/lightrag.py:1892-1915)
+              - success: PROCESSED (lightrag/lightrag.py:2045-2065)
+              - failure: FAILED (lightrag/lightrag.py:1988-2008, lightrag/lightrag.py:2115-2133)
+      - Snippet (immediate persistence):
+
+        async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+            async with self._storage_lock:
+                for doc_id, doc_data in data.items():
+                    if "chunks_list" not in doc_data:
+                        doc_data["chunks_list"] = []
+                self._data.update(data)
+                await set_all_update_flags(self.namespace, workspace=self.workspace)
+            await self.index_done_callback()
+      - Data it contains (shape): {doc_id: {"status": "pending|processing|processed|failed", "content_summary": str, "content_length": int, "file_path": str,
+        "track_id": str, "chunks_count": int, "chunks_list": [chunk_id...], "error_msg": str|None, "metadata": {...}, "created_at": iso, "updated_at": iso}}
+      - Flush timing: immediate on every status transition (because upsert calls index_done_callback).
+  - kv_store_llm_response_cache.json
+      - Written by:
+          - save_to_cache → hashing_kv.upsert — lightrag/utils.py:1451 / lightrag/utils.py:1496
+          - Persisted by JsonKVStorage.index_done_callback — lightrag/kg/json_kv_impl.py:77 (via _insert_done)
+      - Snippet (cache save):
+
+        flattened_key = generate_cache_key(cache_data.mode, cache_data.cache_type, cache_data.args_hash)
+        cache_entry = {"return": cache_data.content, "cache_type": cache_data.cache_type, "chunk_id": cache_data.chunk_id, "original_prompt": cache_data.prompt,
+  "queryparam": ...}
+        await hashing_kv.upsert({flattened_key: cache_entry})
+      - Data it contains (shape): { "default:extract:<hash>": {"return": str, "cache_type": "extract|summary|...", "chunk_id": "chunk-...", "original_prompt": str,
+        "queryparam": dict|None, "_id": key, "create_time": int, "update_time": int}, ... }
+      - Flush timing: via _insert_done after each processed doc; also explicitly attempted on failures (lightrag/lightrag.py:1976-1984, lightrag/lightrag.py:2103-
+        2111).
+  - kv_store_full_entities.json
+      - Written by:
+          - merge_nodes_and_edges phase 3 → full_entities_storage.upsert — lightrag/operate.py:2750
+          - Persisted by _insert_done — lightrag/lightrag.py:2226
+      - Snippet:
+
+        await full_entities_storage.upsert(
+            {doc_id: {"entity_names": list(final_entity_names), "count": len(final_entity_names)}}
+        )
+      - Data it contains (shape): {doc_id: {"entity_names": [str...], "count": int, "_id": doc_id, "create_time": int, "update_time": int}}
+      - Flush timing: via _insert_done after each processed doc.
+  - kv_store_full_relations.json
+      - Written by:
+          - merge_nodes_and_edges phase 3 → full_relations_storage.upsert — lightrag/operate.py:2760
+          - Persisted by _insert_done — lightrag/lightrag.py:2226
+      - Snippet:
+
+        await full_relations_storage.upsert(
+            {doc_id: {"relation_pairs": [list(pair) for pair in final_relation_pairs], "count": len(final_relation_pairs)}}
+        )
+      - Data it contains (shape): {doc_id: {"relation_pairs": [[src,tgt]...], "count": int, "_id": doc_id, "create_time": int, "update_time": int}}
+      - Flush timing: via _insert_done after each processed doc.
+  - kv_store_entity_chunks.json
+      - Written by:
+          - _merge_nodes_then_upsert → entity_chunks_storage.upsert — lightrag/operate.py:1638
+          - Also updated during relation merge when appending chunks to existing entities (lightrag/operate.py:2267)
+          - Persisted by _insert_done — lightrag/lightrag.py:2226
+      - Snippet:
+
+        await entity_chunks_storage.upsert(
+            {entity_name: {"chunk_ids": full_source_ids, "count": len(full_source_ids)}}
+        )
+      - Data it contains (shape): {entity_name: {"chunk_ids": [chunk_id...], "count": int, "_id": entity_name, "create_time": int, "update_time": int}}
+      - Flush timing: via _insert_done.
+  - kv_store_relation_chunks.json
+      - Written by:
+          - _merge_edges_then_upsert → relation_chunks_storage.upsert — lightrag/operate.py:1951
+          - Persisted by _insert_done — lightrag/lightrag.py:2226
+      - Snippet:
+
+        await relation_chunks_storage.upsert(
+            {storage_key: {"chunk_ids": full_source_ids, "count": len(full_source_ids)}}
+        )
+      - Data it contains (shape): { "<src><SEP><tgt>": {"chunk_ids": [chunk_id...], "count": int, "_id": key, "create_time": int, "update_time": int}}
+      - Flush timing: via _insert_done.
+  - vdb_chunks.json
+      - Written by:
+          - NanoVectorDBStorage.__post_init__ sets file path — lightrag/kg/nano_vector_db_impl.py:55
+          - Persisted by NanoVectorDBStorage.index_done_callback — lightrag/kg/nano_vector_db_impl.py:273
+          - Called by _insert_done — lightrag/lightrag.py:2226
+      - Snippet (file path):
+
+        self._client_file_name = os.path.join(workspace_dir, f"vdb_{self.namespace}.json")
+        self._client = NanoVectorDB(self.embedding_func.embedding_dim, storage_file=self._client_file_name)
+      - Data it contains: NanoVectorDB JSON with stored vectors + metadata (__id__, __created_at__, and fields in meta_fields; plus compressed vector).
+      - Flush timing: via _insert_done.
+  - vdb_entities.json
+      - Written by:
+          - _merge_nodes_then_upsert → entity_vdb.upsert(...) — lightrag/operate.py:1850-1868
+          - Persisted by NanoVectorDBStorage.index_done_callback — lightrag/kg/nano_vector_db_impl.py:273
+      - Data it contains: entity vectors keyed by ent-<md5>, with meta fields {entity_name, source_id, content, file_path}.
+      - Flush timing: via _insert_done.
+  - vdb_relationships.json
+      - Written by:
+          - _merge_edges_then_upsert → relationships VDB upsert path (calls safe_vdb_operation_with_exception(...) around lightrag/operate.py:2388-2394)
+          - Persisted by NanoVectorDBStorage.index_done_callback — lightrag/kg/nano_vector_db_impl.py:273
+      - Data it contains: relationship vectors keyed by rel-<md5>, with meta fields {src_id, tgt_id, source_id, content, file_path}.
+      - Flush timing: via _insert_done.
+
+  # Minimal sequence diagram
+
+  - wnc_scripts/openai_test.py:main → wnc_scripts/utils_test.py:load_mixed_docs → lightrag/utils.py:compute_mdhash_id → lightrag/lightrag.py:LightRAG.insert →
+    lightrag/lightrag.py:LightRAG.ainsert → lightrag/lightrag.py:LightRAG.apipeline_enqueue_documents → lightrag/
+    lightrag.py:LightRAG.apipeline_process_enqueue_documents → lightrag/lightrag.py:process_document → lightrag/operate.py:chunking_by_token_size → lightrag/kg/
+    nano_vector_db_impl.py:NanoVectorDBStorage.upsert → lightrag/lightrag.py:LightRAG._process_extract_entities → lightrag/operate.py:extract_entities → lightrag/
+    utils.py:use_llm_func_with_cache → lightrag/operate.py:_process_extraction_result → lightrag/operate.py:merge_nodes_and_edges → lightrag/
+    operate.py:_merge_nodes_then_upsert / lightrag/operate.py:_merge_edges_then_upsert → lightrag/lightrag.py:LightRAG._insert_done →
+    (JsonKVStorage.index_done_callback, JsonDocStatusStorage.index_done_callback, NanoVectorDBStorage.index_done_callback, NetworkXStorage.index_done_callback)
+
