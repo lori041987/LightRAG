@@ -1,0 +1,1067 @@
+• - ## 0. Entry points (Summary)
+      - Python (package)
+          - Function/class name (entry point): main
+          - Code location: wnc_scripts/openai_test.py:95
+          - Code snippet (10–20 lines):
+
+                config = _load_openai_test_config(Path(args.config))
+                kdb_dir = Path(args.kdb_dir) if args.kdb_dir else Path(config.kdb_dir)
+                working_dir = str(args.working_dir) if args.working_dir else str(config.working_dir)
+                mode = str(args.mode) if args.mode else str(config.mode)
+                question = args.question if args.question is not None else str(config.question)
+                if not question.strip():
+                    raise SystemExit(
+                        "Missing question. Provide `--question ...` or set `CONFIG.question` in the config file."
+                    )
+          - How it’s invoked (example call from the script): answer = rag.query(question, param=QueryParam(mode=mode)) (wnc_scripts/openai_test.py:590)
+  - ## 1. Query orchestration (Summary)
+      - Purpose: For mode="hybrid", LightRAG first extracts query keywords (HL/LL) using the configured LLM function, then performs both “local” (entity-centric) and
+        “global” (relation-centric) retrieval against the knowledge graph + vector stores, merges the results (round-robin + dedupe), fetches related text chunks,
+        optionally reranks/truncates chunks to fit a token budget, builds a final system prompt by injecting the assembled context, and calls the LLM again to
+        synthesize the final answer. The script logs the question and the final answer string (non-streaming default) after the query completes.
+      - Functions involved (names + locations only):
+          - main — wnc_scripts/openai_test.py:95
+          - LightRAG.query — lightrag/lightrag.py:2740
+          - LightRAG.aquery — lightrag/lightrag.py:2761
+          - LightRAG.aquery_llm — lightrag/lightrag.py:3042
+          - kg_query — lightrag/operate.py:3885
+          - get_keywords_from_query — lightrag/operate.py:4095
+          - extract_keywords_only — lightrag/operate.py:4127
+          - openai_complete_if_cache (LLM call) — lightrag/llm/openai.py:197
+          - _build_query_context — lightrag/operate.py:4919
+          - _perform_kg_search — lightrag/operate.py:4294
+          - _get_node_data — lightrag/operate.py:5039
+          - _get_edge_data — lightrag/operate.py:5312
+          - _merge_all_chunks — lightrag/operate.py:4634
+          - _build_context_str — lightrag/operate.py:4736
+          - process_chunks_unified (rerank/truncate) — lightrag/utils.py:3062
+          - apply_rerank_if_enabled — lightrag/utils.py:2978
+          - generate_reference_list_from_chunks — lightrag/utils.py:3667
+          - convert_to_user_format — lightrag/utils.py:3543
+          - Final log — wnc_scripts/openai_test.py:593
+      - Outputs/artifacts touched (high level):
+          - Storage reads (during query): self.entities_vdb, self.relationships_vdb, self.chunk_entity_relation_graph, self.text_chunks (all created in
+            LightRAG.__post_init__, initialized in LightRAG.initialize_storages).
+          - Cache reads/writes (optional; disabled by default in provided config): self.llm_response_cache via handle_cache/save_to_cache.
+          - Network calls (when using OpenAI bindings): openai_complete_if_cache (chat completions) and embeddings via embedding_func → openai_embed.func (used when
+            vector operations need embeddings).
+  - ## 2. Script wrapper (Details)
+  - ## 2.1 wnc_scripts/openai_test.py:main (question selection)
+      - Function/class name: main
+      - Purpose: Parse CLI/config; select mode and question (CLI overrides config); exit if question is empty.
+      - Trigger/Caller: if __name__ == "__main__": main() (wnc_scripts/openai_test.py:599)
+      - Code location(s): wnc_scripts/openai_test.py:95, wnc_scripts/openai_test.py:154, wnc_scripts/openai_test.py:158
+      - Code snippet (10–20 lines):
+
+                args = parser.parse_args()
+
+                # Important argparse behavior:
+                # option names like `--skip-index` become attributes like `args.skip_index` (dashes -> underscores).
+                config = _load_openai_test_config(Path(args.config))
+                kdb_dir = Path(args.kdb_dir) if args.kdb_dir else Path(config.kdb_dir)
+                working_dir = str(args.working_dir) if args.working_dir else str(config.working_dir)
+                mode = str(args.mode) if args.mode else str(config.mode)
+                question = args.question if args.question is not None else str(config.question)
+                if not question.strip():
+                    raise SystemExit(
+                        "Missing question. Provide `--question ...` or set `CONFIG.question` in the config file."
+                    )
+      - Inputs:
+          - CLI: --question, --mode, --working-dir, --config, …
+          - Config: CONFIG.question, CONFIG.mode (wnc_scripts/openai_test_config.py:67, wnc_scripts/openai_test_config.py:69)
+      - Outputs: In-memory question: str, mode: str; proceeds to create LightRAG and query.
+      - Side effects (files/network/storage): None directly (argument parsing only).
+      - Errors/edge cases:
+          - Exits if missing question (empty/whitespace) (wnc_scripts/openai_test.py:159).
+  - ## 2.2 wnc_scripts/openai_test.py:llm_model_func
+      - Function/class name: llm_model_func (nested async function inside main)
+      - Purpose: Provide the LLM callable passed into LightRAG; used for keyword extraction and answer synthesis (calls openai_complete_if_cache).
+      - Trigger/Caller:
+          - Keyword extraction: extract_keywords_only → use_model_func(kw_prompt, keyword_extraction=True) → this function.
+          - Answer synthesis: kg_query → use_model_func(user_query, system_prompt=..., stream=...) → this function.
+      - Code location(s): wnc_scripts/openai_test.py:309
+      - Code snippet (10–20 lines):
+
+                ) -> str:
+                    # LLM (chat completion) function used by LightRAG for:
+                    # - keyword extraction
+                    # - answer synthesis (and sometimes summarization/entity extraction)
+                    return await openai_complete_if_cache(
+                        config.openai.chat_model,
+                        prompt,
+                        system_prompt=system_prompt,
+                        history_messages=history_messages,
+                        api_key=api_key,
+                        base_url=config.openai.base_url,
+                        timeout=config.openai.timeout,
+                        use_azure=config.openai.use_azure,
+                        azure_deployment=config.openai.azure_deployment,
+                        api_version=config.openai.api_version,
+                        keyword_extraction=keyword_extraction,
+                        **kwargs,
+                    )
+      - Inputs:
+          - prompt: str, system_prompt: str|None, history_messages: list, keyword_extraction: bool, plus OpenAI config values.
+      - Outputs:
+          - Returns str (unless openai_complete_if_cache is asked to stream; then upstream may receive an async iterator).
+      - Side effects (files/network/storage):
+          - Network: calls OpenAI-compatible Chat Completions via openai_complete_if_cache.
+          - Optional cache effects inside LightRAG pipeline occur outside this function (this function itself doesn’t touch LightRAG KV cache).
+      - Errors/edge cases:
+          - Propagates OpenAI client errors thrown by openai_complete_if_cache.
+  - ## 2.3 wnc_scripts/openai_test.py:embedding_func
+      - Function/class name: embedding_func (nested async function inside main)
+      - Purpose: Provide embeddings callable passed into LightRAG; used for vector indexing and query-time embeddings where needed.
+      - Trigger/Caller: Storage/vector operations that call text_chunks_db.embedding_func or storage query methods that embed queries.
+      - Code location(s): wnc_scripts/openai_test.py:340
+      - Code snippet (10–20 lines):
+
+                # Embedding function used by LightRAG for vector indexing + query vectors.
+                # The decorator injects `embedding_dim` / `max_token_size` automatically.
+                #
+                # NOTE: `openai_embed` does not accept a top-level `timeout=` kwarg;
+                # timeout must be passed via `client_configs`.
+                client_configs = (
+                    {"timeout": config.openai.timeout} if config.openai.timeout is not None else None
+                )
+                return await openai_embed.func(
+                    texts,
+                    model=config.openai.embed_model,
+                    api_key=api_key,
+                    base_url=config.openai.base_url,
+                    embedding_dim=embedding_dim,
+                    max_token_size=max_token_size,
+                    client_configs=client_configs,
+                    use_azure=config.openai.use_azure,
+                    azure_deployment=config.openai.azure_deployment,
+                    api_version=config.openai.api_version,
+                )
+      - Inputs: texts: list[str] (+ injected embedding_dim, max_token_size).
+      - Outputs: np.ndarray of embeddings.
+      - Side effects (files/network/storage): Network call to OpenAI embeddings API via openai_embed.func.
+      - Errors/edge cases: Propagates embedding API errors raised by openai_embed.
+  - ## 2.4 wnc_scripts/openai_test.py:main (query call → final log)
+      - Function/class name: main
+      - Purpose: Dispatch between multimodal query (RAG-Anything) vs standard LightRAG query; log the final answer.
+      - Trigger/Caller: same main execution path after storages are initialized and (optionally) indexing has run.
+      - Code location(s): wnc_scripts/openai_test.py:527, wnc_scripts/openai_test.py:590, wnc_scripts/openai_test.py:593
+      - Code snippet (10–20 lines):
+
+                rag_multi = _make_raganything(vision_model_func)
+                with phase("Query (multimodal)"):
+                    logger.info("Question:\n%s", question.strip())
+                    answer = loop.run_until_complete(
+                        rag_multi.query_with_multimodal(question, mode=mode)
+                    )
+            else:
+                with phase("Query"):
+                    logger.info("Question:\n%s", question.strip())
+                    answer = rag.query(question, param=QueryParam(mode=mode))
+
+            logger.info("Question:\n%s", question.strip())
+            logger.info("Answer:\n%s", answer)
+      - Inputs:
+          - question: str (selected earlier)
+          - mode: str (selected earlier)
+          - QueryParam(mode=mode) (default stream=False, default enable_rerank from env)
+      - Outputs:
+          - answer: typically str (non-streaming path); can be an iterator type if streaming is enabled downstream.
+      - Side effects (files/network/storage):
+          - Calls into LightRAG query pipeline (storage reads; LLM calls; optional cache reads/writes).
+          - Logs question + answer.
+      - Errors/edge cases:
+          - If multimodal is enabled but raganything isn’t installed, exits earlier (wnc_scripts/openai_test.py:532–536).
+  - ## 2.5 wnc_scripts/openai_test.py: final answer is logged
+      - Function/class name: main (final logging step)
+      - Purpose: Log the final answer value after query returns.
+      - Trigger/Caller: End of main query block.
+      - Code location(s): wnc_scripts/openai_test.py:593
+      - Code snippet (10–20 lines):
+
+                with phase("Query"):
+                    logger.info("Question:\n%s", question.strip())
+                    answer = rag.query(question, param=QueryParam(mode=mode))
+
+            logger.info("Question:\n%s", question.strip())
+            logger.info("Answer:\n%s", answer)
+      - Inputs: answer (returned from LightRAG.query).
+      - Outputs: Log line containing answer content.
+      - Side effects (files/network/storage): Writes logs to configured handlers.
+      - Errors/edge cases:
+          - If answer is a streaming iterator object, logging will log its representation (not streamed content).
+  - ## 3. LightRAG core API (Details)
+  - ## 3.1 lightrag/lightrag.py:LightRAG.__post_init__
+      - Function/class name: LightRAG.__post_init__
+      - Purpose: Instantiate the storage objects used during query (KV, VDB, graph, cache); wrap embedding/LLM funcs for concurrency control.
+      - Trigger/Caller: Called automatically when rag = LightRAG(...) is constructed in main.
+      - Code location(s):
+          - Storage objects created: lightrag/lightrag.py:595 (llm_response_cache), lightrag/lightrag.py:602 (text_chunks), lightrag/lightrag.py:638
+            (chunk_entity_relation_graph), lightrag/lightrag.py:644 (entities_vdb), lightrag/lightrag.py:650 (relationships_vdb)
+      - Code snippet (10–20 lines):
+
+                self.chunk_entity_relation_graph: BaseGraphStorage = self.graph_storage_cls(  # type: ignore
+                    namespace=NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION,
+                    workspace=self.workspace,
+                    embedding_func=self.embedding_func,
+                )
+
+                self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+                    namespace=NameSpace.VECTOR_STORE_ENTITIES,
+                    workspace=self.workspace,
+                    embedding_func=self.embedding_func,
+                    meta_fields={"entity_name", "source_id", "content", "file_path"},
+                )
+                self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+                    namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
+                    workspace=self.workspace,
+                    embedding_func=self.embedding_func,
+                    meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+                )
+      - Inputs: LightRAG constructor args (from main), including working_dir, llm_model_func, embedding_func.
+      - Outputs: A constructed LightRAG instance with storage members set (not yet loaded from disk until initialize_storages).
+      - Side effects (files/network/storage):
+          - Creates working_dir if missing (lightrag/lightrag.py:490–493).
+          - Instantiates storage objects; does not perform IO-heavy initialization here.
+      - Errors/edge cases:
+          - Storage compatibility/env validation can raise/warn (verify_storage_implementation, check_storage_env_vars).
+  - ## 3.2 lightrag/lightrag.py:LightRAG.initialize_storages
+      - Function/class name: LightRAG.initialize_storages
+      - Purpose: Initialize/load all storages (KV/VDB/graph/cache) so queries can read them.
+      - Trigger/Caller: loop.run_until_complete(rag.initialize_storages()) (wnc_scripts/openai_test.py:380)
+      - Code location(s): lightrag/lightrag.py:689
+      - Code snippet (10–20 lines):
+
+                # Auto-initialize pipeline_status for this workspace
+                from lightrag.kg.shared_storage import initialize_pipeline_status
+
+                await initialize_pipeline_status(workspace=self.workspace)
+
+                for storage in (
+                    self.full_docs,
+                    self.text_chunks,
+                    self.full_entities,
+                    self.full_relations,
+                    self.entity_chunks,
+                    self.relation_chunks,
+                    self.entities_vdb,
+                    self.relationships_vdb,
+                    self.chunks_vdb,
+                    self.chunk_entity_relation_graph,
+                    self.llm_response_cache,
+                    self.doc_status,
+                ):
+                    if storage:
+                        # logger.debug(f"Initializing storage: {storage}")
+                        await storage.initialize()
+      - Inputs: self (storages already constructed in __post_init__).
+      - Outputs: Storages transitioned to initialized state (self._storages_status = INITIALIZED).
+      - Side effects (files/network/storage):
+          - Loads existing storage data from configured backends (for default JSON-based backends, this means files under working_dir such as kv_store_*.json,
+            vdb_*.json, graph_*.graphml — see WNC note in lightrag/lightrag.py:692–704).
+      - Errors/edge cases:
+          - Any storage backend initialize() can raise (backend-specific IO/db errors).
+  - ## 3.3 lightrag/lightrag.py:LightRAG.query
+      - Function/class name: LightRAG.query
+      - Purpose: Sync wrapper that runs the async query pipeline and returns either a string answer or a streaming iterator object.
+      - Trigger/Caller: answer = rag.query(question, param=QueryParam(mode=mode)) (wnc_scripts/openai_test.py:590)
+      - Code location(s): lightrag/lightrag.py:2740
+      - Code snippet (10–20 lines):
+
+            def query(
+                self,
+                query: str,
+                param: QueryParam = QueryParam(),
+                system_prompt: str | None = None,
+            ) -> str | Iterator[str]:
+                """
+                Perform a sync query.
+                ...
+                """
+                loop = always_get_an_event_loop()
+
+                return loop.run_until_complete(self.aquery(query, param, system_prompt))  # type: ignore
+      - Inputs: query: str, param: QueryParam, optional system_prompt.
+      - Outputs:
+          - Non-streaming: str
+          - Streaming: returns the async iterator object produced by downstream code (see LightRAG.aquery).
+      - Side effects (files/network/storage): Delegates to async pipeline.
+      - Errors/edge cases: Propagates exceptions raised in aquery chain (unless caught later).
+  - ## 3.4 lightrag/lightrag.py:LightRAG.aquery
+      - Function/class name: LightRAG.aquery
+      - Purpose: Backward-compat async wrapper around the newer structured API aquery_llm; returns only the LLM response content.
+      - Trigger/Caller: LightRAG.query (lightrag/lightrag.py:2759)
+      - Code location(s): lightrag/lightrag.py:2761
+      - Code snippet (10–20 lines):
+
+                # Call the new aquery_llm function to get complete results
+                result = await self.aquery_llm(query, param, system_prompt)
+
+                # Extract and return only the LLM response for backward compatibility
+                llm_response = result.get("llm_response", {})
+
+                if llm_response.get("is_streaming"):
+                    return llm_response.get("response_iterator")
+                else:
+                    return llm_response.get("content", "")
+      - Inputs: query: str, param: QueryParam, optional system_prompt.
+      - Outputs:
+          - If streaming: AsyncIterator[str] (returned as-is)
+          - Else: str (this is where the final “answer becomes a Python str” for the non-streaming path)
+      - Side effects (files/network/storage): Delegates to aquery_llm.
+      - Errors/edge cases:
+          - If aquery_llm returns no llm_response, returns empty string.
+  - ## 3.5 lightrag/lightrag.py:LightRAG.aquery_llm
+      - Function/class name: LightRAG.aquery_llm
+      - Purpose: Top-level async query API that dispatches by mode to retrieval (kg_query/naive_query) or direct LLM (bypass), then returns structured data + LLM
+        response fields.
+      - Trigger/Caller: LightRAG.aquery (lightrag/lightrag.py:2785)
+      - Code location(s): lightrag/lightrag.py:3042
+      - Code snippet (10–20 lines):
+
+                global_config = asdict(self)
+
+                try:
+                    query_result = None
+
+                    if param.mode in ["local", "global", "hybrid", "mix"]:
+                        query_result = await kg_query(
+                            query.strip(),
+                            self.chunk_entity_relation_graph,
+                            self.entities_vdb,
+                            self.relationships_vdb,
+                            self.text_chunks,
+                            param,
+                            global_config,
+                            hashing_kv=self.llm_response_cache,
+                            system_prompt=system_prompt,
+                            chunks_vdb=self.chunks_vdb,
+                        )
+      - Inputs: query, param.mode (e.g. "hybrid"), storage objects on self.
+      - Outputs: dict[str, Any] with keys like status, data, metadata, plus llm_response (added near lightrag/lightrag.py:3175).
+      - Side effects (files/network/storage):
+          - Retrieval reads from graph/VDB/KV; LLM calls for keywords + final answer; optional cache read/write.
+      - Errors/edge cases:
+          - Unknown mode raises ValueError (lightrag/lightrag.py:3152).
+          - Wraps whole operation in try/except and returns failure dict on exception (lightrag/lightrag.py:3187–3200).
+  - ## 4. Query execution + keyword extraction (Details)
+  - ## 4.1 lightrag/operate.py:kg_query
+      - Function/class name: kg_query
+      - Purpose: Hybrid/local/global/mix query worker: extract keywords → build context → build system prompt → (optionally cached) LLM call → return QueryResult.
+      - Trigger/Caller: LightRAG.aquery_llm for mode in ["local","global","hybrid","mix"] (lightrag/lightrag.py:3091)
+      - Code location(s):
+          - Keyword extraction: lightrag/operate.py:3937
+          - Context building: lightrag/operate.py:3960
+          - Prompt formatting: lightrag/operate.py:3990
+          - Cache + LLM call: lightrag/operate.py:4026
+      - Code snippet (10–20 lines):
+
+                cached_result = await handle_cache(
+                    hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+                )
+
+                if cached_result is not None:
+                    cached_response, _ = cached_result  # Extract content, ignore timestamp
+                    logger.info(
+                        " == LLM cache == Query cache hit, using cached response as query result"
+                    )
+                    response = cached_response
+                else:
+                    response = await use_model_func(
+                        user_query,
+                        system_prompt=sys_prompt,
+                        history_messages=query_param.conversation_history,
+                        enable_cot=True,
+                        stream=query_param.stream,
+                    )
+      - Inputs:
+          - query: str
+          - Storages: knowledge_graph_inst, entities_vdb, relationships_vdb, text_chunks_db
+          - query_param (notably: mode, stream, enable_rerank, token limits)
+          - hashing_kv (llm_response_cache) for optional caching
+          - system_prompt override (optional)
+      - Outputs:
+          - Returns QueryResult:
+              - Non-streaming: QueryResult(content=str, raw_data=...)
+              - Streaming: QueryResult(response_iterator=AsyncIterator[str], is_streaming=True, raw_data=...)
+          - Returns None if _build_query_context returns None (lightrag/operate.py:3972–3974)
+      - Side effects (files/network/storage):
+          - Calls LLM twice (keywords + answer) unless cache hits and/or keywords are provided.
+          - Cache read via handle_cache; cache write via save_to_cache when enabled.
+      - Errors/edge cases:
+          - Empty query returns fail response (lightrag/operate.py:3927–3928).
+          - If both keyword lists empty, may force LL keywords to [query] for short queries, else fail (lightrag/operate.py:3949–3954).
+          - only_need_context / only_need_prompt short-circuit outputs.
+  - ## 4.2 lightrag/operate.py:get_keywords_from_query
+      - Function/class name: get_keywords_from_query
+      - Purpose: Return (HL keywords, LL keywords) either from QueryParam or by calling extract_keywords_only.
+      - Trigger/Caller: kg_query (lightrag/operate.py:3937)
+      - Code location(s): lightrag/operate.py:4095
+      - Code snippet (10–20 lines):
+
+            # Check if pre-defined keywords are already provided
+            if query_param.hl_keywords or query_param.ll_keywords:
+                return query_param.hl_keywords, query_param.ll_keywords
+
+            # Extract keywords using extract_keywords_only function which already supports conversation history
+            hl_keywords, ll_keywords = await extract_keywords_only(
+                query, query_param, global_config, hashing_kv
+            )
+            return hl_keywords, ll_keywords
+      - Inputs: query, query_param.hl_keywords, query_param.ll_keywords, hashing_kv (optional).
+      - Outputs: tuple[list[str], list[str]].
+      - Side effects (files/network/storage): Delegates to extract_keywords_only (which may call LLM and cache).
+      - Errors/edge cases: None directly.
+  - ## 4.3 lightrag/operate.py:extract_keywords_only
+      - Function/class name: extract_keywords_only
+      - Purpose: Build keyword-extraction prompt, optionally read/write cache, call LLM in keyword_extraction=True mode, parse JSON into HL/LL keyword lists.
+      - Trigger/Caller: get_keywords_from_query (lightrag/operate.py:4121)
+      - Code location(s): lightrag/operate.py:4127
+      - Code snippet (10–20 lines):
+
+            # 3. Build the keyword-extraction prompt
+            kw_prompt = PROMPTS["keywords_extraction"].format(
+                query=text,
+                examples=examples,
+                language=language,
+            )
+
+            tokenizer: Tokenizer = global_config["tokenizer"]
+            len_of_prompts = len(tokenizer.encode(kw_prompt))
+            logger.debug(
+                f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens (Prompt: {len_of_prompts})"
+            )
+
+            # 4. Call the LLM for keyword extraction
+            if param.model_func:
+                use_model_func = param.model_func
+            else:
+                use_model_func = global_config["llm_model_func"]
+                # Apply higher priority (5) to query relation LLM function
+                use_model_func = partial(use_model_func, _priority=5)
+
+            result = await use_model_func(kw_prompt, keyword_extraction=True)
+      - Inputs:
+          - text: str (the query), param.mode (used in cache hash), global_config["tokenizer"], global_config["llm_model_func"]
+      - Outputs: (hl_keywords: list[str], ll_keywords: list[str])
+      - Side effects (files/network/storage):
+          - Optional cache read: handle_cache(..., cache_type="keywords") earlier in this function.
+          - LLM call via use_model_func(..., keyword_extraction=True) (network).
+          - Optional cache write if enabled later in function.
+      - Errors/edge cases:
+          - Cache JSON parse failure falls back to live extraction (lightrag/operate.py:4154–4164).
+          - JSON parse failure of LLM response returns ([], []) (lightrag/operate.py:4190–4199).
+  - ## 4.4 lightrag/utils.py:compute_args_hash
+      - Function/class name: compute_args_hash
+      - Purpose: Create MD5 hash from argument list for cache keys (safe unicode handling).
+      - Trigger/Caller:
+          - Keyword cache hashing in extract_keywords_only (lightrag/operate.py:4145)
+          - Query cache hashing in kg_query (lightrag/operate.py:4011)
+      - Code location(s): lightrag/utils.py:561
+      - Code snippet (10–20 lines):
+
+            # Convert all arguments to strings and join them
+            args_str = "".join([str(arg) for arg in args])
+
+            # Use 'replace' error handling to safely encode problematic Unicode characters
+            # This replaces invalid characters with Unicode replacement character (U+FFFD)
+            try:
+                return md5(args_str.encode("utf-8")).hexdigest()
+            except UnicodeEncodeError:
+                # Handle surrogate characters and other encoding issues
+                safe_bytes = args_str.encode("utf-8", errors="replace")
+                return md5(safe_bytes).hexdigest()
+      - Inputs: *args: Any
+      - Outputs: str hash
+      - Side effects: None
+      - Errors/edge cases: Handles UnicodeEncodeError by replacing invalid chars.
+  - ## 4.5 lightrag/utils.py:handle_cache
+      - Function/class name: handle_cache
+      - Purpose: Cache lookup for LLM results using flattened key format {mode}:{cache_type}:{args_hash} with enable/disable gating.
+      - Trigger/Caller:
+          - extract_keywords_only (lightrag/operate.py:4150)
+          - kg_query (lightrag/operate.py:4026)
+      - Code location(s): lightrag/utils.py:1427
+      - Code snippet (10–20 lines):
+
+            if mode != "default":  # handle cache for all type of query
+                if not hashing_kv.global_config.get("enable_llm_cache"):
+                    # [WNC] Output log for early return (cache disabled for queries)
+                    wnc_log(
+                        purpose="[OUTPUT] handle_cache early return - cache disabled for queries",
+                        outputs={"result": None, "reason": "enable_llm_cache is False", "mode": mode},
+                        level="info",
+                    )
+                    return None
+            else:  # handle cache for entity extraction
+                if not hashing_kv.global_config.get("enable_llm_cache_for_entity_extract"):
+                    # [WNC] Output log for early return (cache disabled for entity extraction)
+                    wnc_log(
+                        purpose="[OUTPUT] handle_cache early return - cache disabled for entity extraction",
+                        outputs={"result": None, "reason": "enable_llm_cache_for_entity_extract is False", "mode": mode},
+                        level="info",
+                    )
+                    return None
+      - Inputs: hashing_kv, args_hash, prompt, mode, cache_type
+      - Outputs: (content: str, create_time: int) | None
+      - Side effects (files/network/storage): Reads from hashing_kv.get_by_id(...) when enabled.
+      - Errors/edge cases:
+          - If hashing_kv is None or caching disabled, returns None early.
+  - ## 4.6 lightrag/utils.py:save_to_cache
+      - Function/class name: save_to_cache
+      - Purpose: Write LLM result content into KV cache (skips empty/streaming/duplicate content).
+      - Trigger/Caller:
+          - Query caching in kg_query when enabled (lightrag/operate.py:4059)
+          - Keyword caching in extract_keywords_only when enabled (later in function)
+      - Code location(s): lightrag/utils.py:1540
+      - Code snippet (10–20 lines):
+
+            # Create cache entry with flattened structure
+            cache_entry = {
+                "return": cache_data.content,
+                "cache_type": cache_data.cache_type,
+                "chunk_id": cache_data.chunk_id if cache_data.chunk_id is not None else None,
+                "original_prompt": cache_data.prompt,
+                "queryparam": cache_data.queryparam
+                if cache_data.queryparam is not None
+                else None,
+            }
+
+            logger.info(f" == LLM cache == saving: {flattened_key}")
+
+            # Save using flattened key
+            await hashing_kv.upsert({flattened_key: cache_entry})
+      - Inputs: hashing_kv, cache_data: CacheData
+      - Outputs: None
+      - Side effects (files/network/storage): Writes to KV store via hashing_kv.upsert(...) when enabled.
+      - Errors/edge cases:
+          - Skips caching on streaming content (hasattr(content, "__aiter__")) earlier in function.
+  - ## 4.7 lightrag/llm/openai.py:openai_complete_if_cache
+      - Function/class name: openai_complete_if_cache
+      - Purpose: Make OpenAI-compatible chat completion request (optionally parse structured output for keyword extraction); return str or streaming async iterator.
+      - Trigger/Caller:
+          - From wnc_scripts/openai_test.py:llm_model_func for both keyword extraction and final answering.
+      - Code location(s): lightrag/llm/openai.py:197
+      - Code snippet (10–20 lines):
+
+            # Determine the correct model identifier to use
+            # For Azure OpenAI, we must use the deployment name instead of the model name
+            api_model = azure_deployment if use_azure and azure_deployment else model
+
+            try:
+                # Don't use async with context manager, use client directly
+                if "response_format" in kwargs:
+                    response = await openai_async_client.chat.completions.parse(
+                        model=api_model, messages=messages, **kwargs
+                    )
+                else:
+                    response = await openai_async_client.chat.completions.create(
+                        model=api_model, messages=messages, **kwargs
+                    )
+      - Inputs: model, prompt, system_prompt, history_messages, stream, keyword_extraction, OpenAI/Azure config.
+      - Outputs:
+          - Non-streaming: str
+          - Streaming: an AsyncIterator[str] (the function checks hasattr(response, "__aiter__") later)
+      - Side effects (files/network/storage): Network calls to OpenAI-compatible endpoint.
+      - Errors/edge cases:
+          - Retries on rate limit/connection/timeout/invalid response (decorator at lightrag/llm/openai.py:187–196).
+          - Raises OpenAI exceptions on failures.
+  - ## 5. Retrieval + context assembly (Details)
+  - ## 5.1 lightrag/operate.py:_build_query_context
+      - Function/class name: _build_query_context
+      - Purpose: Orchestrate retrieval into a final context string + structured raw_data using a 4-stage pipeline: search → token truncation → chunk merge → context
+        build.
+      - Trigger/Caller: kg_query (lightrag/operate.py:3960)
+      - Code location(s): lightrag/operate.py:4919
+      - Code snippet (10–20 lines):
+
+            # Stage 1: Pure search
+            search_result = await _perform_kg_search(
+                query,
+                ll_keywords,
+                hl_keywords,
+                knowledge_graph_inst,
+                entities_vdb,
+                relationships_vdb,
+                text_chunks_db,
+                query_param,
+                chunks_vdb,
+            )
+
+            # Stage 2: Apply token truncation for LLM efficiency
+            truncation_result = await _apply_token_truncation(
+                search_result,
+                query_param,
+                text_chunks_db.global_config,
+            )
+
+            # Stage 3: Merge chunks using filtered entities/relations
+            merged_chunks = await _merge_all_chunks(
+                filtered_entities=truncation_result["filtered_entities"],
+                filtered_relations=truncation_result["filtered_relations"],
+                vector_chunks=search_result["vector_chunks"],
+      - Inputs: query, keyword strings, storage objects, query_param.
+      - Outputs: QueryContextResult(context: str, raw_data: dict) or None (no context).
+      - Side effects (files/network/storage): Delegates to lower-level retrieval; may trigger embeddings calls (vector selection).
+      - Errors/edge cases:
+          - Returns None for empty query or when no retrievable results exist for mode (e.g., hybrid with no entities/relations and not mix).
+  - ## 5.2 lightrag/operate.py:_perform_kg_search (hybrid dispatch)
+      - Function/class name: _perform_kg_search
+      - Purpose: Execute the mode-specific KG retrieval. For hybrid, it runs both local (_get_node_data) and global (_get_edge_data) retrieval then returns merged
+        entity/relation lists for later stages.
+      - Trigger/Caller: _build_query_context (lightrag/operate.py:4942)
+      - Code location(s): lightrag/operate.py:4294
+      - Code snippet (10–20 lines):
+
+            else:  # hybrid or mix mode
+                if len(ll_keywords) > 0:
+                    local_entities, local_relations = await _get_node_data(
+                        ll_keywords,
+                        knowledge_graph_inst,
+                        entities_vdb,
+                        query_param,
+                    )
+                if len(hl_keywords) > 0:
+                    global_relations, global_entities = await _get_edge_data(
+                        hl_keywords,
+                        knowledge_graph_inst,
+                        relationships_vdb,
+                        query_param,
+                    )
+      - Inputs: ll_keywords and hl_keywords strings; query_param.mode is expected to be "hybrid" here.
+      - Outputs: dict containing final_entities, final_relations, vector_chunks (empty for hybrid), etc.
+      - Side effects (files/network/storage): Reads from entity/relationship vector DBs and the graph store (via functions it calls).
+      - Errors/edge cases:
+          - If vector embedding precompute fails, logs warning and continues (lightrag/operate.py:4331–4339).
+  - ## 5.3 lightrag/operate.py:_get_node_data
+      - Function/class name: _get_node_data
+      - Purpose: Local-mode retrieval: query entity VDB by keywords; fetch corresponding node records + degrees from graph; compute most related edges.
+      - Trigger/Caller: _perform_kg_search for hybrid/local (lightrag/operate.py:4360)
+      - Code location(s): lightrag/operate.py:5039
+      - Code snippet (10–20 lines):
+
+            # get similar entities
+            logger.info(
+                f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
+            )
+
+            results = await entities_vdb.query(query, top_k=query_param.top_k)
+
+            if not len(results):
+                return [], []
+
+            # Extract all entity IDs from your results list
+            node_ids = [r["entity_name"] for r in results]
+
+            # Call the batch node retrieval and degree functions concurrently.
+            nodes_dict, degrees_dict = await asyncio.gather(
+                knowledge_graph_inst.get_nodes_batch(node_ids),
+                knowledge_graph_inst.node_degrees_batch(node_ids),
+            )
+      - Inputs: query (LL keywords string), entities_vdb, knowledge_graph_inst, query_param.top_k.
+      - Outputs: (node_datas: list[dict], use_relations: list[dict])
+      - Side effects (files/network/storage):
+          - Vector DB query against entities_vdb
+          - Graph DB reads: get_nodes_batch, node_degrees_batch
+      - Errors/edge cases:
+          - Missing nodes in graph logs warning (lightrag/operate.py:5068–5069).
+  - ## 5.4 lightrag/operate.py:_find_most_related_edges_from_entities
+      - Function/class name: _find_most_related_edges_from_entities
+      - Purpose: Given retrieved entities, fetch connected edges from graph and rank them using edge degrees + weights.
+      - Trigger/Caller: _get_node_data (lightrag/operate.py:5082)
+      - Code location(s): lightrag/operate.py:5097
+      - Code snippet (10–20 lines):
+
+            node_names = [dp["entity_name"] for dp in node_datas]
+            batch_edges_dict = await knowledge_graph_inst.get_nodes_edges_batch(node_names)
+
+            all_edges = []
+            seen = set()
+
+            for node_name in node_names:
+                this_edges = batch_edges_dict.get(node_name, [])
+                for e in this_edges:
+                    sorted_edge = tuple(sorted(e))
+                    if sorted_edge not in seen:
+                        seen.add(sorted_edge)
+                        all_edges.append(sorted_edge)
+
+            # Prepare edge pairs in two forms:
+            # For the batch edge properties function, use dicts.
+            edge_pairs_dicts = [{"src": e[0], "tgt": e[1]} for e in all_edges]
+            # For edge degrees, use tuples.
+            edge_pairs_tuples = list(all_edges)  # all_edges is already a list of tuples
+
+            # Call the batched functions concurrently.
+            edge_data_dict, edge_degrees_dict = await asyncio.gather(
+                knowledge_graph_inst.get_edges_batch(edge_pairs_dicts),
+                knowledge_graph_inst.edge_degrees_batch(edge_pairs_tuples),
+            )
+      - Inputs: node_datas, knowledge_graph_inst.
+      - Outputs: Ranked list of edge dicts (used as “local relations”).
+      - Side effects (files/network/storage): Graph store batch reads.
+      - Errors/edge cases: Missing weights handled later with default 1.0 (lightrag/operate.py:5133–5137).
+  - ## 5.5 lightrag/operate.py:_get_edge_data
+      - Function/class name: _get_edge_data
+      - Purpose: Global-mode retrieval: query relationship VDB by keywords; fetch edge properties from graph; expand to related entities.
+      - Trigger/Caller: _perform_kg_search for hybrid/global (lightrag/operate.py:4367)
+      - Code location(s): lightrag/operate.py:5312
+      - Code snippet (10–20 lines):
+
+            logger.info(
+                f"Query edges: {keywords} (top_k:{query_param.top_k}, cosine:{relationships_vdb.cosine_better_than_threshold})"
+            )
+
+            results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
+
+            if not len(results):
+                return [], []
+
+            # Prepare edge pairs in two forms:
+            # For the batch edge properties function, use dicts.
+            edge_pairs_dicts = [{"src": r["src_id"], "tgt": r["tgt_id"]} for r in results]
+            edge_data_dict = await knowledge_graph_inst.get_edges_batch(edge_pairs_dicts)
+      - Inputs: keywords (HL keyword string), relationships_vdb, knowledge_graph_inst.
+      - Outputs: (edge_datas: list[dict], use_entities: list[dict])
+      - Side effects (files/network/storage):
+          - Vector DB query against relationships_vdb
+          - Graph DB reads: get_edges_batch (+ node fetch via helper)
+      - Errors/edge cases:
+          - Missing weight in edge props defaults to 1.0 (lightrag/operate.py:5338–5342).
+  - ## 5.6 lightrag/operate.py:_find_most_related_entities_from_relationships
+      - Function/class name: _find_most_related_entities_from_relationships
+      - Purpose: Expand relationship hits into a list of unique endpoint entities and fetch their node records from the graph.
+      - Trigger/Caller: _get_edge_data (lightrag/operate.py:5355)
+      - Code location(s): lightrag/operate.py:5368
+      - Code snippet (10–20 lines):
+
+            entity_names = []
+            seen = set()
+
+            for e in edge_datas:
+                if e["src_id"] not in seen:
+                    entity_names.append(e["src_id"])
+                    seen.add(e["src_id"])
+                if e["tgt_id"] not in seen:
+                    entity_names.append(e["tgt_id"])
+                    seen.add(e["tgt_id"])
+
+            # Only get nodes data, no need for node degrees
+            nodes_dict = await knowledge_graph_inst.get_nodes_batch(entity_names)
+      - Inputs: edge_datas, knowledge_graph_inst.
+      - Outputs: node_datas: list[dict]
+      - Side effects (files/network/storage): Graph store batch read.
+      - Errors/edge cases: Logs warning when a node is missing (lightrag/operate.py:5391–5393).
+  - ## 5.7 lightrag/operate.py:_merge_all_chunks
+      - Function/class name: _merge_all_chunks
+      - Purpose: Fetch entity-related chunks and relation-related chunks, then round-robin merge/dedupe them (plus vector chunks for mix mode).
+      - Trigger/Caller: _build_query_context (lightrag/operate.py:4969)
+      - Code location(s): lightrag/operate.py:4634
+      - Code snippet (10–20 lines):
+
+            if filtered_entities and text_chunks_db:
+                entity_chunks = await _find_related_text_unit_from_entities(
+                    filtered_entities,
+                    query_param,
+                    text_chunks_db,
+                    knowledge_graph_inst,
+                    query,
+                    chunks_vdb,
+                    chunk_tracking=chunk_tracking,
+                    query_embedding=query_embedding,
+                )
+
+            # Get chunks from relations
+            relation_chunks = []
+            if filtered_relations and text_chunks_db:
+                relation_chunks = await _find_related_text_unit_from_relations(
+                    filtered_relations,
+                    query_param,
+                    text_chunks_db,
+                    entity_chunks,  # For deduplication
+                    query,
+                    chunks_vdb,
+      - Inputs: filtered entities/relations, text_chunks_db, knowledge_graph_inst, query_param, optional chunks_vdb.
+      - Outputs: merged_chunks: list[dict] with fields like content, file_path, chunk_id.
+      - Side effects (files/network/storage): Reads chunk records from text_chunks_db via get_by_ids in downstream functions.
+      - Errors/edge cases: If no chunks selected, returns empty list.
+  - ## 5.8 lightrag/operate.py:_find_related_text_unit_from_entities
+      - Function/class name: _find_related_text_unit_from_entities
+      - Purpose: Select text chunks referenced by retrieved entities, using either WEIGHT polling or VECTOR similarity; batch-load chunk contents from KV store.
+      - Trigger/Caller: _merge_all_chunks (lightrag/operate.py:4655)
+      - Code location(s): lightrag/operate.py:5153
+      - Code snippet (10–20 lines):
+
+            # Step 4: Apply the selected chunk selection algorithm
+            # Pick by vector similarity:
+            #     The order of text chunks aligns with the naive retrieval's destination.
+            #     When reranking is disabled, the text chunks delivered to the LLM tend to favor naive retrieval.
+            if kg_chunk_pick_method == "VECTOR" and query and chunks_vdb:
+                num_of_chunks = int(max_related_chunks * len(entities_with_chunks) / 2)
+
+                # Get embedding function from global config
+                actual_embedding_func = text_chunks_db.embedding_func
+                if not actual_embedding_func:
+                    logger.warning("No embedding function found, falling back to WEIGHT method")
+                    kg_chunk_pick_method = "WEIGHT"
+                else:
+                    try:
+                        selected_chunk_ids = await pick_by_vector_similarity(
+                            query=query,
+                            text_chunks_storage=text_chunks_db,
+                            chunks_vdb=chunks_vdb,
+                            num_of_chunks=num_of_chunks,
+                            entity_info=entities_with_chunks,
+                            embedding_func=actual_embedding_func,
+                            query_embedding=query_embedding,
+                        )
+      - Inputs: node_datas (with source_id chunk references), text_chunks_db, query, optional chunks_vdb, query_embedding.
+      - Outputs: result_chunks: list[dict] (each includes content, chunk_id, source_type="entity", plus metadata).
+      - Side effects (files/network/storage):
+          - Reads chunk payloads via text_chunks_db.get_by_ids(...).
+          - If VECTOR method used, may call embeddings via text_chunks_db.embedding_func and/or vector DB similarity functions.
+      - Errors/edge cases:
+          - Falls back from VECTOR to WEIGHT if embedding fails or selects no chunks.
+  - ## 5.9 lightrag/operate.py:_find_related_text_unit_from_relations
+      - Function/class name: _find_related_text_unit_from_relations
+      - Purpose: Select text chunks referenced by retrieved relations, deduplicating against entity-chunks; then batch-load chunk contents from KV store.
+      - Trigger/Caller: _merge_all_chunks (lightrag/operate.py:4669)
+      - Code location(s): lightrag/operate.py:5401
+      - Code snippet (10–20 lines):
+
+            # Extract chunk IDs from entity_chunks for deduplication
+            entity_chunk_ids = set()
+            if entity_chunks:
+                for chunk in entity_chunks:
+                    chunk_id = chunk.get("chunk_id")
+                    if chunk_id:
+                        entity_chunk_ids.add(chunk_id)
+
+            chunk_occurrence_count = {}
+            # Track unique chunk_ids that have been removed to avoid double counting
+            removed_entity_chunk_ids = set()
+
+            for relation_info in relations_with_chunks:
+                deduplicated_chunks = []
+                for chunk_id in relation_info["chunks"]:
+                    # Skip chunks that already exist in entity_chunks
+                    if chunk_id in entity_chunk_ids:
+                        # Only count each unique chunk_id once
+                        removed_entity_chunk_ids.add(chunk_id)
+                        continue
+
+                    chunk_occurrence_count[chunk_id] = (
+                        chunk_occurrence_count.get(chunk_id, 0) + 1
+                    )
+      - Inputs: edge_datas (with source_id chunk refs), entity_chunks for dedupe, text_chunks_db, optional chunks_vdb.
+      - Outputs: result_chunks: list[dict] (each includes content, chunk_id, source_type="relation", etc.).
+      - Side effects (files/network/storage): Reads chunk payloads from text_chunks_db.get_by_ids(...) later in this function.
+      - Errors/edge cases:
+          - Returns [] when no relation-related chunks remain after deduplication (lightrag/operate.py:5501–5505).
+  - ## 5.10 lightrag/operate.py:_build_context_str
+      - Function/class name: _build_context_str
+      - Purpose: Allocate token budget, rerank/truncate chunks, generate reference IDs, and format final KG context string + structured data.
+      - Trigger/Caller: _build_query_context (lightrag/operate.py:4991)
+      - Code location(s): lightrag/operate.py:4736
+      - Code snippet (10–20 lines):
+
+            # Apply token truncation to chunks using the dynamic limit
+            truncated_chunks = await process_chunks_unified(
+                query=query,
+                unique_chunks=merged_chunks,
+                query_param=query_param,
+                global_config=global_config,
+                source_type=query_param.mode,
+                chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
+            )
+
+            # Generate reference list from truncated chunks using the new common function
+            reference_list, truncated_chunks = generate_reference_list_from_chunks(
+                truncated_chunks
+            )
+      - Inputs: entities_context, relations_context, merged_chunks, query_param token limits, global_config["tokenizer"].
+      - Outputs: (context_str: str, final_data: dict[str, Any])
+      - Side effects (files/network/storage): None directly; relies on provided data structures.
+      - Errors/edge cases:
+          - Missing tokenizer returns failure-shaped data (lightrag/operate.py:4752–4764).
+  - ## 6. Chunk post-processing + formatting (Details)
+  - ## 6.1 lightrag/utils.py:process_chunks_unified
+      - Function/class name: process_chunks_unified
+      - Purpose: Apply reranking (if enabled), enforce chunk_top_k, then token-truncate chunks and assign display IDs (DC1, DC2, …).
+      - Trigger/Caller: _build_context_str (lightrag/operate.py:4822)
+      - Code location(s): lightrag/utils.py:3062
+      - Code snippet (10–20 lines):
+
+            origin_count = len(unique_chunks)
+
+            # 1. Apply reranking if enabled and query is provided
+            if query_param.enable_rerank and query and unique_chunks:
+                rerank_top_k = query_param.chunk_top_k or len(unique_chunks)
+                unique_chunks = await apply_rerank_if_enabled(
+                    query=query,
+                    retrieved_docs=unique_chunks,
+                    global_config=global_config,
+                    enable_rerank=query_param.enable_rerank,
+                    top_n=rerank_top_k,
+                )
+
+            # 2. Filter by minimum rerank score if reranking is enabled
+            if query_param.enable_rerank and unique_chunks:
+                min_rerank_score = global_config.get("min_rerank_score", 0.5)
+      - Inputs: query, unique_chunks, query_param.enable_rerank, global_config["rerank_model_func"] (optional).
+      - Outputs: list[dict] processed chunks.
+      - Side effects: None (pure processing), except uses rerank model func if configured.
+      - Errors/edge cases:
+          - If rerank enabled but no rerank model configured, rerank helper warns and returns original docs.
+  - ## 6.2 lightrag/utils.py:apply_rerank_if_enabled
+      - Function/class name: apply_rerank_if_enabled
+      - Purpose: Call configured rerank_model_func and reorder chunks; attach rerank_score to selected chunks.
+      - Trigger/Caller: process_chunks_unified (lightrag/utils.py:3092)
+      - Code location(s): lightrag/utils.py:2978
+      - Code snippet (10–20 lines):
+
+            # Call the new rerank function that returns index-based results
+            rerank_results = await rerank_func(
+                query=query,
+                documents=document_texts,
+                top_n=top_n,
+            )
+
+            # Process rerank results based on return format
+            if rerank_results and len(rerank_results) > 0:
+                # Check if results are in the new index-based format
+                if isinstance(rerank_results[0], dict) and "index" in rerank_results[0]:
+                    # New format: [{"index": 0, "relevance_score": 0.85}, ...]
+                    reranked_docs = []
+                    for result in rerank_results:
+                        index = result["index"]
+                        relevance_score = result["relevance_score"]
+
+                        # Get original document and add rerank score
+                        if 0 <= index < len(retrieved_docs):
+                            doc = retrieved_docs[index].copy()
+                            doc["rerank_score"] = relevance_score
+                            reranked_docs.append(doc)
+      - Inputs: query, retrieved_docs, global_config["rerank_model_func"], top_n.
+      - Outputs: Reranked list of docs (or original docs if not enabled/available).
+      - Side effects: Calls external rerank model function if configured.
+      - Errors/edge cases: Catches exceptions and falls back to original ordering (lightrag/utils.py:3057–3059).
+  - ## 6.3 lightrag/utils.py:generate_reference_list_from_chunks
+      - Function/class name: generate_reference_list_from_chunks
+      - Purpose: Assign reference_ids by file_path frequency/order and return both reference list and updated chunks.
+      - Trigger/Caller: _build_context_str (lightrag/operate.py:4832)
+      - Code location(s): lightrag/utils.py:3667
+      - Code snippet (10–20 lines):
+
+            # 1. Extract all valid file_paths and count their occurrences
+            file_path_counts = {}
+            for chunk in chunks:
+                file_path = chunk.get("file_path", "")
+                if file_path and file_path != "unknown_source":
+                    file_path_counts[file_path] = file_path_counts.get(file_path, 0) + 1
+
+            # 2. Sort file paths by frequency (descending), then by first appearance order
+            # Create a list of (file_path, count, first_index) tuples
+            file_path_with_indices = []
+            seen_paths = set()
+            for i, chunk in enumerate(chunks):
+                file_path = chunk.get("file_path", "")
+                if file_path and file_path != "unknown_source" and file_path not in seen_paths:
+                    file_path_with_indices.append((file_path, file_path_counts[file_path], i))
+                    seen_paths.add(file_path)
+
+            # Sort by count (descending), then by first appearance index (ascending)
+            sorted_file_paths = sorted(file_path_with_indices, key=lambda x: (-x[1], x[2]))
+            unique_file_paths = [item[0] for item in sorted_file_paths]
+      - Inputs: chunks: list[dict] with file_path.
+      - Outputs: (reference_list: list[dict], updated_chunks: list[dict])
+      - Side effects: None
+      - Errors/edge cases: Returns ([], []) if chunks empty.
+  - ## 6.4 lightrag/utils.py:convert_to_user_format
+      - Function/class name: convert_to_user_format
+      - Purpose: Convert internal entity/relation/chunk context structures into user-facing data layout with metadata.
+      - Trigger/Caller: _build_context_str (lightrag/operate.py:4903)
+      - Code location(s): lightrag/utils.py:3543
+      - Code snippet (10–20 lines):
+
+            # Convert entities format using original data when available
+            formatted_entities = []
+            for entity in entities_context:
+                entity_name = entity.get("entity", "")
+
+                # Try to get original data first
+                original_entity = None
+                if entity_id_to_original and entity_name in entity_id_to_original:
+                    original_entity = entity_id_to_original[entity_name]
+
+                if original_entity:
+                    # Use original database data
+                    formatted_entities.append(
+                        {
+                            "entity_name": original_entity.get("entity_name", entity_name),
+                            "entity_type": original_entity.get("entity_type", "UNKNOWN"),
+                            "description": original_entity.get("description", ""),
+                            "source_id": original_entity.get("source_id", ""),
+                            "file_path": original_entity.get("file_path", "unknown_source"),
+                            "created_at": original_entity.get("created_at", ""),
+                        }
+                    )
+      - Inputs: entities_context, relations_context, chunks, references, query_mode, plus optional original-data mappings.
+      - Outputs: dict[str, Any] shaped like {"status","message","data":{...},"metadata":{...}}
+      - Side effects: None
+      - Errors/edge cases: Falls back to context-derived values when original mappings aren’t provided.
+  - ## 7. Prompt + embeddings (Details)
+  - ## 7.1 lightrag/prompt.py:PROMPTS["rag_response"]
+      - Function/class name: PROMPTS["rag_response"] (prompt template string)
+      - Purpose: System prompt template used by kg_query to inject {context_data}, {response_type}, {user_prompt}.
+      - Trigger/Caller: kg_query formats it into sys_prompt (lightrag/operate.py:3990–3995).
+      - Code location(s): lightrag/prompt.py:224
+      - Code snippet (10–20 lines):
+
+            PROMPTS["rag_response"] = """---Role---
+
+            You are an expert AI assistant specializing in synthesizing information from a provided knowledge base. Your primary function is to answer user queries
+  accurately by ONLY using the information within the provided **Context**.
+
+            ---Goal---
+
+            Generate a comprehensive, well-structured answer to the user query.
+            The answer must integrate relevant facts from the Knowledge Graph and Document Chunks found in the **Context**.
+            Consider the conversation history if provided to maintain conversational flow and avoid repeating information.
+            ...
+            ---Context---
+
+            {context_data}
+            """
+      - Inputs: Formatted by .format(response_type=..., user_prompt=..., context_data=...).
+      - Outputs: sys_prompt: str
+      - Side effects: None
+      - Errors/edge cases: Formatting errors would raise if required placeholders missing (not expected here).
+  - ## 7.2 lightrag/llm/openai.py:openai_embed
+      - Function/class name: openai_embed
+      - Purpose: Call OpenAI embeddings endpoint and return numpy embeddings (used via openai_embed.func from embedding_func).
+      - Trigger/Caller: wnc_scripts/openai_test.py:embedding_func (wnc_scripts/openai_test.py:353)
+      - Code location(s): lightrag/llm/openai.py:717
+      - Code snippet (10–20 lines):
+
+            async with openai_async_client:
+                # Determine the correct model identifier to use
+                # For Azure OpenAI, we must use the deployment name instead of the model name
+                api_model = azure_deployment if use_azure and azure_deployment else model
+
+                # Prepare API call parameters
+                api_params = {
+                    "model": api_model,
+                    "input": texts,
+                    "encoding_format": "base64",
+                }
+
+                # Add dimensions parameter only if embedding_dim is provided
+                if embedding_dim is not None:
+                    api_params["dimensions"] = embedding_dim
+
+                # Make API call
+                response = await openai_async_client.embeddings.create(**api_params)
+      - Inputs: texts, model, OpenAI/Azure config, optional embedding_dim.
+      - Outputs: np.ndarray
+      - Side effects (files/network/storage): Network embeddings request.
+      - Errors/edge cases: Retries on rate limit/connection/timeout (decorator).

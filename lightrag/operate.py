@@ -3924,7 +3924,30 @@ async def kg_query(
 
         Returns None when no relevant context could be constructed for the query.
     """
+    wnc_log(
+        purpose="Hybrid/local/global/mix query worker that extracts keywords, builds context, builds system prompt, calls LLM (with optional cache), and returns QueryResult",
+        inputs={
+            "query": query,
+            "mode": query_param.mode,
+            "stream": query_param.stream,
+            "enable_rerank": query_param.enable_rerank,
+            "only_need_context": query_param.only_need_context,
+            "only_need_prompt": query_param.only_need_prompt,
+        },
+        side_effects="Reads from entities_vdb, relationships_vdb, knowledge_graph_inst, text_chunks_db for retrieval.\n"
+                    "Calls LLM twice: once for keyword extraction (via get_keywords_from_query) and once for final answer.\n"
+                    "Optional cache read via handle_cache and cache write via save_to_cache when enabled.",
+        note="Returns None if _build_query_context returns None (no retrievable results).\n"
+             "Returns QueryResult with different content based on only_need_context, only_need_prompt, or stream flags.\n"
+             "For streaming queries, returns QueryResult with response_iterator; for non-streaming, returns content as string.",
+        level="info",
+    )
     if not query:
+        wnc_log(
+            purpose="[OUTPUT] kg_query early return - empty query",
+            outputs={"result": "fail_response", "reason": "empty query"},
+            level="info",
+        )
         return QueryResult(content=PROMPTS["fail_response"])
 
     if query_param.model_func:
@@ -3971,10 +3994,25 @@ async def kg_query(
 
     if context_result is None:
         logger.info("[kg_query] No query context could be built; returning no-result.")
+        wnc_log(
+            purpose="[OUTPUT] kg_query early return - no context",
+            outputs={"result": None, "reason": "no query context could be built"},
+            level="info",
+        )
         return None
 
     # Return different content based on query parameters
     if query_param.only_need_context and not query_param.only_need_prompt:
+        wnc_log(
+            purpose="[OUTPUT] kg_query only_need_context",
+            outputs={
+                "only_need_context": True,
+                "context": context_result.context,
+                "context length": len(context_result.context),
+                "note": "Returns only the retrieved context string without calling LLM - used for inspecting what context was retrieved from knowledge graph",
+            },
+            level="info",
+        )
         return QueryResult(
             content=context_result.context, raw_data=context_result.raw_data
         )
@@ -3998,6 +4036,16 @@ async def kg_query(
 
     if query_param.only_need_prompt:
         prompt_content = "\n\n".join([sys_prompt, "---User Query---", user_query])
+        wnc_log(
+            purpose="[OUTPUT] kg_query only_need_prompt",
+            outputs={
+                "only_need_prompt": True,
+                "prompt_content": prompt_content,
+                "prompt length": len(prompt_content),
+                "note": "Returns the complete prompt (system prompt + user query) without calling LLM - used for debugging/inspecting what prompt would be sent to LLM",
+            },
+            level="info",
+        )
         return QueryResult(content=prompt_content, raw_data=context_result.raw_data)
 
     # Call LLM
@@ -4082,9 +4130,29 @@ async def kg_query(
                 .strip()
             )
 
+        wnc_log(
+            purpose="[OUTPUT] kg_query non-streaming response",
+            outputs={
+                "is_streaming": False,
+                "response": response,
+                "response length": len(response),
+                "cache_hit": cached_result is not None,
+                "note": "Normal completion - LLM returned string response (non-streaming mode)",
+            },
+            level="info",
+        )
         return QueryResult(content=response, raw_data=context_result.raw_data)
     else:
         # Streaming response (AsyncIterator)
+        wnc_log(
+            purpose="[OUTPUT] kg_query streaming response",
+            outputs={
+                "is_streaming": True,
+                "cache_hit": cached_result is not None,
+                "note": "Normal completion - LLM returned streaming response iterator (streaming mode enabled)",
+            },
+            level="info",
+        )
         return QueryResult(
             response_iterator=response,
             raw_data=context_result.raw_data,
@@ -4113,13 +4181,43 @@ async def get_keywords_from_query(
     Returns:
         A tuple containing (high_level_keywords, low_level_keywords)
     """
+    wnc_log(
+        purpose="Returns HL/LL keywords either from QueryParam or by calling extract_keywords_only to extract them via LLM",
+        inputs={
+            "query": query,
+            "mode": query_param.mode,
+            "hl_keywords provided": query_param.hl_keywords if query_param.hl_keywords else "None",
+            "ll_keywords provided": query_param.ll_keywords if query_param.ll_keywords else "None",
+        },
+        side_effects="Delegates to extract_keywords_only which may call LLM and cache when keywords not provided",
+        note="Returns pre-defined keywords immediately if provided in query_param, otherwise extracts them via LLM.",
+        level="info",
+    )
     # Check if pre-defined keywords are already provided
     if query_param.hl_keywords or query_param.ll_keywords:
+        wnc_log(
+            purpose="[OUTPUT] get_keywords_from_query using provided keywords",
+            outputs={
+                "hl_keywords": query_param.hl_keywords,
+                "ll_keywords": query_param.ll_keywords,
+                "note": "Using pre-defined keywords from query_param without LLM extraction",
+            },
+            level="info",
+        )
         return query_param.hl_keywords, query_param.ll_keywords
 
     # Extract keywords using extract_keywords_only function which already supports conversation history
     hl_keywords, ll_keywords = await extract_keywords_only(
         query, query_param, global_config, hashing_kv
+    )
+    wnc_log(
+        purpose="[OUTPUT] get_keywords_from_query extracted keywords",
+        outputs={
+            "hl_keywords": hl_keywords,
+            "ll_keywords": ll_keywords,
+            "note": "Keywords extracted via LLM using extract_keywords_only",
+        },
+        level="info",
     )
     return hl_keywords, ll_keywords
 
@@ -4135,6 +4233,21 @@ async def extract_keywords_only(
     This method does NOT build the final RAG context or provide a final answer.
     It ONLY extracts keywords (hl_keywords, ll_keywords).
     """
+    wnc_log(
+        purpose="Extracts high-level and low-level keywords from query text by calling LLM with keyword_extraction=True mode and parsing the JSON response",
+        inputs={
+            "text": text,
+            "mode": param.mode,
+            "hashing_kv": "provided" if hashing_kv else "None",
+        },
+        side_effects="Optional cache read via handle_cache (cache_type='keywords').\n"
+                    "Calls LLM via use_model_func with keyword_extraction=True flag.\n"
+                    "Optional cache write via save_to_cache when keywords extracted and cache enabled.",
+        note="LLM returns JSON with high_level_keywords and low_level_keywords arrays.\n"
+             "Falls back to live extraction if cache JSON parse fails.\n"
+             "Returns ([], []) if LLM response JSON parse fails.",
+        level="info",
+    )
 
     # 1. Build the examples
     examples = "\n".join(PROMPTS["keywords_extraction_examples"])
@@ -4154,6 +4267,16 @@ async def extract_keywords_only(
         cached_response, _ = cached_result  # Extract content, ignore timestamp
         try:
             keywords_data = json_repair.loads(cached_response)
+            wnc_log(
+                purpose="[OUTPUT] extract_keywords_only cache hit",
+                outputs={
+                    "hl_keywords": keywords_data.get("high_level_keywords", []),
+                    "ll_keywords": keywords_data.get("low_level_keywords", []),
+                    "cache_hit": True,
+                    "note": "Keywords retrieved from cache without calling LLM",
+                },
+                level="info",
+            )
             return keywords_data.get("high_level_keywords", []), keywords_data.get(
                 "low_level_keywords", []
             )
@@ -4191,10 +4314,30 @@ async def extract_keywords_only(
         keywords_data = json_repair.loads(result)
         if not keywords_data:
             logger.error("No JSON-like structure found in the LLM respond.")
+            wnc_log(
+                purpose="[OUTPUT] extract_keywords_only early return - no JSON structure",
+                outputs={
+                    "hl_keywords": [],
+                    "ll_keywords": [],
+                    "reason": "No JSON-like structure found in LLM response",
+                    "note": "LLM response parsing failed - no valid JSON structure",
+                },
+                level="info",
+            )
             return [], []
     except json.JSONDecodeError as e:
         logger.error(f"JSON parsing error: {e}")
         logger.error(f"LLM respond: {result}")
+        wnc_log(
+            purpose="[OUTPUT] extract_keywords_only early return - JSON parse error",
+            outputs={
+                "hl_keywords": [],
+                "ll_keywords": [],
+                "error": str(e),
+                "note": "LLM response JSON parsing failed",
+            },
+            level="info",
+        )
         return [], []
 
     hl_keywords = keywords_data.get("high_level_keywords", [])
@@ -4231,6 +4374,16 @@ async def extract_keywords_only(
                 ),
             )
 
+    wnc_log(
+        purpose="[OUTPUT] extract_keywords_only LLM extraction complete",
+        outputs={
+            "hl_keywords": hl_keywords,
+            "ll_keywords": ll_keywords,
+            "cache_hit": False,
+            "note": "Keywords extracted from LLM and optionally saved to cache",
+        },
+        level="info",
+    )
     return hl_keywords, ll_keywords
 
 
@@ -4306,6 +4459,21 @@ async def _perform_kg_search(
     Pure search logic that retrieves raw entities, relations, and vector chunks.
     No token truncation or formatting - just raw search results.
     """
+    wnc_log(
+        purpose="Executes mode-specific knowledge graph retrieval by running local (_get_node_data) and/or global (_get_edge_data) retrieval then returns merged entity/relation lists",
+        inputs={
+            "query": query,
+            "ll_keywords": ll_keywords,
+            "hl_keywords": hl_keywords,
+            "mode": query_param.mode,
+        },
+        side_effects="Reads from entity/relationship vector databases and graph store via _get_node_data and _get_edge_data.\n"
+                    "For mix mode, also reads from chunks_vdb via _get_vector_context.\n"
+                    "May call embedding function to pre-compute query embedding for vector operations.",
+        note="For hybrid mode, runs both local and global retrieval then round-robin merges results with deduplication.\n"
+             "Returns dict with final_entities, final_relations, vector_chunks, chunk_tracking, query_embedding.",
+        level="info",
+    )
 
     # Initialize result containers
     local_entities = []
@@ -4451,6 +4619,17 @@ async def _perform_kg_search(
         f"Raw search results: {len(final_entities)} entities, {len(final_relations)} relations, {len(vector_chunks)} vector chunks"
     )
 
+    wnc_log(
+        purpose="[OUTPUT] _perform_kg_search completed",
+        outputs={
+            "final_entities": final_entities,
+            "final_relations": final_relations,
+            "vector_chunks": vector_chunks,
+            "chunk_tracking": chunk_tracking,
+            "note": "Knowledge graph search completed - returned raw search results without token truncation or formatting",
+        },
+        level="info",
+    )
     return {
         "final_entities": final_entities,
         "final_relations": final_relations,
@@ -4646,6 +4825,26 @@ async def _merge_all_chunks(
     """
     Merge chunks from different sources: vector_chunks + entity_chunks + relation_chunks.
     """
+    wnc_log(
+        purpose="Retrieves source text chunks linked to filtered entities/relations from text_chunks_db, then round-robin merges with vector_chunks for comprehensive LLM context",
+        inputs={
+            "filtered_entities": filtered_entities,
+            "filtered_relations": filtered_relations,
+            "vector_chunks": vector_chunks,
+            "mode": query_param.mode if query_param else None,
+        },
+        side_effects="Calls _find_related_text_unit_from_entities and _find_related_text_unit_from_relations.\n"
+                    "Both may read from text_chunks_db and optionally chunks_vdb.\n"
+                    "Updates chunk_tracking dict with source/frequency/order metadata.",
+        note="_build_query_context() uses 4-stage pipeline:\n"
+             "Stage 1 (_perform_kg_search) returns vector_chunks from naive vector similarity search.\n"
+             "Stage 2 (_apply_token_truncation) filters entities/relations by token limits, giving us filtered_entities and filtered_relations.\n"
+             "Stage 3 (_merge_all_chunks - THIS FUNCTION) fetches text chunks associated with filtered entities/relations from the knowledge graph.\n"
+             "Stage 4 (_build_context_str) builds final LLM context with reranking and token truncation.\n"
+             "Why: entities and relations in the KG have source_id fields pointing to text chunks they came from. We retrieve those source chunks and merge with vector_chunks to give the LLM full context.\n"
+             "Returns merged list with round-robin interleaving from 3 sources (vector, entity, relation). Deduplication removes duplicate chunk_ids while preserving first occurrence order.",
+        level="info",
+    )
     if chunk_tracking is None:
         chunk_tracking = {}
 
@@ -4730,6 +4929,16 @@ async def _merge_all_chunks(
         f"Round-robin merged chunks: {origin_len} -> {len(merged_chunks)} (deduplicated {origin_len - len(merged_chunks)})"
     )
 
+    wnc_log(
+        purpose="[OUTPUT] _merge_all_chunks success",
+        outputs={
+            "merged_chunks": merged_chunks,
+            "origin_len": origin_len,
+            "deduplicated_count": origin_len - len(merged_chunks),
+            "note": f"Round-robin merged {len(vector_chunks)} vector + {len(entity_chunks)} entity + {len(relation_chunks)} relation chunks into {len(merged_chunks)} unique chunks",
+        },
+        level="info",
+    )
     return merged_chunks
 
 
@@ -4748,6 +4957,25 @@ async def _build_context_str(
     Build the final LLM context string with token processing.
     This includes dynamic token calculation and final chunk truncation.
     """
+    wnc_log(
+        purpose="Allocates token budget, reranks/truncates chunks, generates reference IDs, formats final KG context string and raw_data structure",
+        inputs={
+            "entities_context": entities_context,
+            "relations_context": relations_context,
+            "merged_chunks": merged_chunks,
+            "query": query,
+            "mode": query_param.mode,
+            "enable_rerank": query_param.enable_rerank,
+        },
+        side_effects="Calls process_chunks_unified (may call rerank_model_func, tokenizer for truncation).\n"
+                    "Calls generate_reference_list_from_chunks to assign reference IDs.\n"
+                    "Calls convert_to_user_format to build raw_data structure.",
+        note="5-step process: (1) Calculate token budgets for entities/relations/chunks, (2) Process/truncate chunks via process_chunks_unified, (3) Generate reference IDs, (4) Format entities/relations/chunks as JSON strings, (5) Build final context string and raw_data dict.\n"
+             "Stage 4 of _build_query_context pipeline - final formatting.\n"
+             "Token budget: max_total_tokens - (sys_prompt + kg_context + query + buffer) = available for chunks.\n"
+             "Returns tuple: (context_string, raw_data_dict) where context is formatted for LLM prompt and raw_data contains structured results.",
+        level="info",
+    )
     tokenizer = global_config.get("tokenizer")
     if not tokenizer:
         logger.error("Missing tokenizer, cannot build LLM context")
@@ -4761,6 +4989,16 @@ async def _build_context_str(
         )
         empty_raw_data["status"] = "failure"
         empty_raw_data["message"] = "Missing tokenizer, cannot build LLM context."
+        wnc_log(
+            purpose="[OUTPUT] _build_context_str early return - no tokenizer",
+            outputs={
+                "context": "",
+                "raw_data": empty_raw_data,
+                "reason": "missing tokenizer",
+                "note": "Cannot calculate token budgets without tokenizer",
+            },
+            level="info",
+        )
         return "", empty_raw_data
 
     # Get token limits
@@ -4869,6 +5107,16 @@ async def _build_context_str(
         )
         empty_raw_data["status"] = "failure"
         empty_raw_data["message"] = "Query returned empty dataset."
+        wnc_log(
+            purpose="[OUTPUT] _build_context_str early return - no content",
+            outputs={
+                "context": "",
+                "raw_data": empty_raw_data,
+                "reason": "no entities, relations, or chunks after processing",
+                "note": "All content was filtered out during token truncation and processing",
+            },
+            level="info",
+        )
         return "", empty_raw_data
 
     # output chunks tracking infomations
@@ -4912,6 +5160,15 @@ async def _build_context_str(
     logger.debug(
         f"[_build_context_str] Final data after conversion: {len(final_data.get('entities', []))} entities, {len(final_data.get('relationships', []))} relationships, {len(final_data.get('chunks', []))} chunks"
     )
+    wnc_log(
+        purpose="[OUTPUT] _build_context_str success",
+        outputs={
+            "context": result,
+            "raw_data": final_data,
+            "note": f"Built final context with {len(entities_context)} entities, {len(relations_context)} relations, {len(chunks_context)} chunks. Context is formatted LLM prompt string, raw_data contains structured results.",
+        },
+        level="info",
+    )
     return result, final_data
 
 
@@ -4933,9 +5190,29 @@ async def _build_query_context(
 
     Returns unified QueryContextResult containing both context and raw_data.
     """
+    wnc_log(
+        purpose="Orchestrates retrieval into final context string and structured raw_data using 4-stage pipeline: search, token truncation, chunk merge, context build",
+        inputs={
+            "query": query,
+            "ll_keywords": ll_keywords,
+            "hl_keywords": hl_keywords,
+            "mode": query_param.mode,
+        },
+        side_effects="Delegates to _perform_kg_search (graph/VDB reads), _apply_token_truncation, _merge_all_chunks (text_chunks_db reads), and _build_context_str.\n"
+                    "May trigger embeddings calls for vector selection in downstream functions.",
+        note="Returns QueryContextResult(context, raw_data) or None if no context.\n"
+             "Returns None for empty query, or when no entities/relations found (except mix mode with chunks).\n"
+             "Returns None when no chunks and no entities/relations context after all stages.",
+        level="info",
+    )
 
     if not query:
         logger.warning("Query is empty, skipping context building")
+        wnc_log(
+            purpose="[OUTPUT] _build_query_context early return - empty query",
+            outputs={"result": None, "reason": "query is empty", "note": "Query validation failed"},
+            level="info",
+        )
         return None
 
     # Stage 1: Pure search
@@ -4953,9 +5230,29 @@ async def _build_query_context(
 
     if not search_result["final_entities"] and not search_result["final_relations"]:
         if query_param.mode != "mix":
+            wnc_log(
+                purpose="[OUTPUT] _build_query_context early return - no entities/relations",
+                outputs={
+                    "result": None,
+                    "reason": "no entities or relations found",
+                    "mode": query_param.mode,
+                    "note": "Search returned no entities/relations and mode is not mix",
+                },
+                level="info",
+            )
             return None
         else:
             if not search_result["chunk_tracking"]:
+                wnc_log(
+                    purpose="[OUTPUT] _build_query_context early return - mix mode no chunks",
+                    outputs={
+                        "result": None,
+                        "reason": "mix mode but no chunk_tracking",
+                        "mode": query_param.mode,
+                        "note": "Mix mode requires chunks but none found in chunk_tracking",
+                    },
+                    level="info",
+                )
                 return None
 
     # Stage 2: Apply token truncation for LLM efficiency
@@ -4984,6 +5281,15 @@ async def _build_query_context(
         and not truncation_result["entities_context"]
         and not truncation_result["relations_context"]
     ):
+        wnc_log(
+            purpose="[OUTPUT] _build_query_context early return - no content after merge",
+            outputs={
+                "result": None,
+                "reason": "no merged chunks and no entities/relations context",
+                "note": "All stages completed but resulted in no content to build context from",
+            },
+            level="info",
+        )
         return None
 
     # Stage 4: Build final LLM context with dynamic token processing
@@ -5033,6 +5339,15 @@ async def _build_query_context(
         f"[_build_query_context] Raw data entities: {len(raw_data.get('data', {}).get('entities', []))}, relationships: {len(raw_data.get('data', {}).get('relationships', []))}, chunks: {len(raw_data.get('data', {}).get('chunks', []))}"
     )
 
+    wnc_log(
+        purpose="[OUTPUT] _build_query_context success",
+        outputs={
+            "context": context,
+            "raw_data": raw_data,
+            "note": "Successfully built query context through all 4 stages - context is LLM prompt string, raw_data contains structured entities/relationships/chunks/references",
+        },
+        level="info",
+    )
     return QueryContextResult(context=context, raw_data=raw_data)
 
 
@@ -5042,6 +5357,21 @@ async def _get_node_data(
     entities_vdb: BaseVectorStorage,
     query_param: QueryParam,
 ):
+    wnc_log(
+        purpose="Local-mode retrieval that queries entity vector database by keywords, fetches node records and connection counts (degrees) from graph for ranking, then computes most related edges",
+        inputs={
+            "query": query,
+            "top_k": query_param.top_k,
+        },
+        side_effects="Vector database query against entities_vdb.\n"
+                    "Graph database reads: get_nodes_batch (node properties), node_degrees_batch (connection counts).\n"
+                    "Calls _find_most_related_edges_from_entities for edge ranking.",
+        note="Cosine similarity = measure of angle between query and entity embedding vectors (1.0=identical, 0.0=unrelated).\n"
+             "Degree = number of edges connected to a node, used as rank indicator.\n"
+             "Weight = relationship strength stored during indexing stage.\n"
+             "Returns (node_datas, use_relations) - entities sorted by cosine similarity desc, relations sorted by (rank+weight) desc.",
+        level="info",
+    )
     # get similar entities
     logger.info(
         f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
@@ -5050,6 +5380,16 @@ async def _get_node_data(
     results = await entities_vdb.query(query, top_k=query_param.top_k)
 
     if not len(results):
+        wnc_log(
+            purpose="[OUTPUT] _get_node_data early return - no entities found",
+            outputs={
+                "node_datas": [],
+                "use_relations": [],
+                "reason": "no entities found in vector search",
+                "note": "Entity vector database returned no results for the query",
+            },
+            level="info",
+        )
         return [], []
 
     # Extract all entity IDs from your results list
@@ -5089,6 +5429,15 @@ async def _get_node_data(
         f"Local query: {len(node_datas)} entites, {len(use_relations)} relations"
     )
 
+    wnc_log(
+        purpose="[OUTPUT] _get_node_data success",
+        outputs={
+            "node_datas": node_datas,
+            "use_relations": use_relations,
+            "note": "Local retrieval completed - entities sorted by cosine similarity, relations sorted by rank+weight",
+        },
+        level="info",
+    )
     # Entities are sorted by cosine similarity
     # Relations are sorted by rank + weight
     return node_datas, use_relations
@@ -5099,6 +5448,18 @@ async def _find_most_related_edges_from_entities(
     query_param: QueryParam,
     knowledge_graph_inst: BaseGraphStorage,
 ):
+    wnc_log(
+        purpose="Fetches connected edges from graph for given entities and ranks by edge degrees + weights",
+        inputs={
+            "node_datas": node_datas,
+            "top_k": query_param.top_k,
+        },
+        side_effects="Graph database reads: get_nodes_edges_batch (fetch all connected edges), get_edges_batch (edge properties), edge_degrees_batch (connection counts).",
+        note="4-step process: (1) Fetch connected edges, (2) Deduplicate edges, (3) Batch fetch properties and degrees, (4) Combine and sort by (rank + weight).\n"
+             "Called by _get_node_data (local mode) to find relationships connected to retrieved entities.\n"
+             "Rank = edge degree (number of connections), weight = relationship strength from indexing.",
+        level="info",
+    )
     node_names = [dp["entity_name"] for dp in node_datas]
     batch_edges_dict = await knowledge_graph_inst.get_nodes_edges_batch(node_names)
 
@@ -5147,6 +5508,14 @@ async def _find_most_related_edges_from_entities(
         all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
     )
 
+    wnc_log(
+        purpose="[OUTPUT] _find_most_related_edges_from_entities success",
+        outputs={
+            "all_edges_data": all_edges_data,
+            "note": f"Found {len(all_edges_data)} edges connected to {len(node_datas)} entities, ranked by (rank + weight) descending",
+        },
+        level="info",
+    )
     return all_edges_data
 
 
@@ -5167,9 +5536,36 @@ async def _find_related_text_unit_from_entities(
     1. WEIGHT: Linear gradient weighted polling based on chunk occurrence count
     2. VECTOR: Vector similarity-based selection using embedding cosine similarity
     """
+    wnc_log(
+        purpose="Extracts chunk IDs from entities' source_id fields, counts occurrences, selects top chunks via WEIGHT polling or VECTOR similarity, retrieves chunk content from text_chunks_db",
+        inputs={
+            "node_datas": node_datas,
+            "kg_chunk_pick_method": text_chunks_db.global_config.get("kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD),
+            "max_related_chunks": text_chunks_db.global_config.get("related_chunk_number", DEFAULT_RELATED_CHUNK_NUMBER),
+            "query": query,
+        },
+        side_effects="Reads text_chunks_db.get_by_ids to fetch chunk content.\n"
+                    "If VECTOR method: may call chunks_vdb.query or embedding_func for similarity ranking.\n"
+                    "Updates chunk_tracking dict with source='E', frequency (occurrence count), order (selection rank).",
+        note="Called by _merge_all_chunks to fetch entity-related chunks.\n"
+             "6-step process: (1) Extract chunk IDs from source_id, (2) Count occurrences and dedupe, (3) Sort by occurrence, (4) Select via WEIGHT or VECTOR, (5) Batch retrieve content, (6) Build results with tracking.\n"
+             "WEIGHT method: weighted polling based on chunk frequency across entities (favors KG-focused chunks).\n"
+             "VECTOR method: ranks by similarity to query (aligns with naive retrieval, favors when reranking disabled).\n"
+             "Returns chunks with source_type='entity' and chunk_id for deduplication.",
+        level="info",
+    )
     logger.debug(f"Finding text chunks from {len(node_datas)} entities")
 
     if not node_datas:
+        wnc_log(
+            purpose="[OUTPUT] _find_related_text_unit_from_entities early return - no entities",
+            outputs={
+                "result_chunks": [],
+                "reason": "node_datas is empty",
+                "note": "No entities provided, returning empty list",
+            },
+            level="info",
+        )
         return []
 
     # Step 1: Collect all text chunks for each entity
@@ -5190,6 +5586,15 @@ async def _find_related_text_unit_from_entities(
 
     if not entities_with_chunks:
         logger.warning("No entities with text chunks found")
+        wnc_log(
+            purpose="[OUTPUT] _find_related_text_unit_from_entities early return - no chunks in entities",
+            outputs={
+                "result_chunks": [],
+                "reason": "no entities with source_id chunks found",
+                "note": "All entities lack source_id field or have empty source_id",
+            },
+            level="info",
+        )
         return []
 
     kg_chunk_pick_method = text_chunks_db.global_config.get(
@@ -5281,6 +5686,16 @@ async def _find_related_text_unit_from_entities(
         )
 
     if not selected_chunk_ids:
+        wnc_log(
+            purpose="[OUTPUT] _find_related_text_unit_from_entities early return - no chunks selected",
+            outputs={
+                "result_chunks": [],
+                "reason": "chunk selection algorithm returned empty list",
+                "kg_chunk_pick_method": kg_chunk_pick_method,
+                "note": "Either WEIGHT or VECTOR method failed to select any chunks",
+            },
+            level="info",
+        )
         return []
 
     # Step 5: Batch retrieve chunk data
@@ -5306,6 +5721,15 @@ async def _find_related_text_unit_from_entities(
                     "order": i + 1,  # 1-based order in final entity-related results
                 }
 
+    wnc_log(
+        purpose="[OUTPUT] _find_related_text_unit_from_entities success",
+        outputs={
+            "result_chunks": result_chunks,
+            "kg_chunk_pick_method": kg_chunk_pick_method,
+            "note": f"Selected {len(result_chunks)} chunks from {len(node_datas)} entities using {kg_chunk_pick_method} method",
+        },
+        level="info",
+    )
     return result_chunks
 
 
@@ -5315,6 +5739,20 @@ async def _get_edge_data(
     relationships_vdb: BaseVectorStorage,
     query_param: QueryParam,
 ):
+    wnc_log(
+        purpose="Global-mode retrieval that queries relationship vector database by keywords, fetches edge properties from graph, then expands to related entities",
+        inputs={
+            "keywords": keywords,
+            "top_k": query_param.top_k,
+        },
+        side_effects="Vector database query against relationships_vdb.\n"
+                    "Graph database reads: get_edges_batch (edge properties).\n"
+                    "Calls _find_most_related_entities_from_relationships to expand to endpoint entities.",
+        note="Returns (edge_datas, use_entities) tuple.\n"
+             "Relations maintain vector search order (sorted by similarity to query).\n"
+             "Returns ([], []) if no relationships found in vector search.",
+        level="info",
+    )
     logger.info(
         f"Query edges: {keywords} (top_k:{query_param.top_k}, cosine:{relationships_vdb.cosine_better_than_threshold})"
     )
@@ -5322,6 +5760,16 @@ async def _get_edge_data(
     results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
 
     if not len(results):
+        wnc_log(
+            purpose="[OUTPUT] _get_edge_data early return - no relationships found",
+            outputs={
+                "edge_datas": [],
+                "use_entities": [],
+                "reason": "no relationships found in vector search",
+                "note": "Relationship vector database returned no results for the keywords",
+            },
+            level="info",
+        )
         return [], []
 
     # Prepare edge pairs in two forms:
@@ -5362,6 +5810,15 @@ async def _get_edge_data(
         f"Global query: {len(use_entities)} entites, {len(edge_datas)} relations"
     )
 
+    wnc_log(
+        purpose="[OUTPUT] _get_edge_data success",
+        outputs={
+            "edge_datas": edge_datas,
+            "use_entities": use_entities,
+            "note": "Global retrieval completed - relationships sorted by vector similarity, entities extracted from relationship endpoints",
+        },
+        level="info",
+    )
     return edge_datas, use_entities
 
 
@@ -5370,6 +5827,18 @@ async def _find_most_related_entities_from_relationships(
     query_param: QueryParam,
     knowledge_graph_inst: BaseGraphStorage,
 ):
+    wnc_log(
+        purpose="Extracts unique entity endpoints (src_id, tgt_id) from the given relationships that were already ranked by relevance",
+        inputs={
+            "edge_datas": edge_datas,
+        },
+        side_effects="Graph database reads: get_nodes_batch (fetch node properties for entity endpoints).",
+        note="Called by _get_edge_data (global mode) to get entities from retrieved relationships.\n"
+             "The 'most related' part comes from the input (edge_datas were already ranked by vector similarity), not from what this function does. This function just extracts the participating entities from those pre-ranked relationships.\n"
+             "Maintains order from edge_datas - entities appear in order based on when their edge appeared.\n"
+             "Deduplicates entities (each entity appears only once even if involved in multiple relationships).",
+        level="info",
+    )
     entity_names = []
     seen = set()
 
@@ -5395,6 +5864,14 @@ async def _find_most_related_entities_from_relationships(
         combined = {**node, "entity_name": entity_name}
         node_datas.append(combined)
 
+    wnc_log(
+        purpose="[OUTPUT] _find_most_related_entities_from_relationships success",
+        outputs={
+            "node_datas": node_datas,
+            "note": f"Extracted {len(node_datas)} unique entities from {len(edge_datas)} relationships",
+        },
+        level="info",
+    )
     return node_datas
 
 
@@ -5415,9 +5892,38 @@ async def _find_related_text_unit_from_relations(
     1. WEIGHT: Linear gradient weighted polling based on chunk occurrence count
     2. VECTOR: Vector similarity-based selection using embedding cosine similarity
     """
+    wnc_log(
+        purpose="Extracts chunk IDs from relations' source_id fields, deduplicates against entity_chunks, selects top chunks via WEIGHT polling or VECTOR similarity, retrieves chunk content from text_chunks_db",
+        inputs={
+            "edge_datas": edge_datas,
+            "entity_chunks": entity_chunks,
+            "kg_chunk_pick_method": text_chunks_db.global_config.get("kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD),
+            "max_related_chunks": text_chunks_db.global_config.get("related_chunk_number", DEFAULT_RELATED_CHUNK_NUMBER),
+            "query": query,
+        },
+        side_effects="Reads text_chunks_db.get_by_ids to fetch chunk content.\n"
+                    "If VECTOR method: may call chunks_vdb.query or embedding_func for similarity ranking.\n"
+                    "Updates chunk_tracking dict with source='R', frequency (occurrence count), order (selection rank).",
+        note="Called by _merge_all_chunks to fetch relation-related chunks.\n"
+             "6-step process: (1) Extract chunk IDs from source_id, (2) Count occurrences and dedupe against entity_chunks, (3) Sort by occurrence, (4) Select via WEIGHT or VECTOR, (5) Batch retrieve content, (6) Build results with tracking.\n"
+             "CRITICAL: Deduplicates against entity_chunks to avoid returning chunks already selected by entities.\n"
+             "WEIGHT method: weighted polling based on chunk frequency across relations.\n"
+             "VECTOR method: ranks by similarity to query.\n"
+             "Returns chunks with source_type='relationship' and chunk_id for deduplication.",
+        level="info",
+    )
     logger.debug(f"Finding text chunks from {len(edge_datas)} relations")
 
     if not edge_datas:
+        wnc_log(
+            purpose="[OUTPUT] _find_related_text_unit_from_relations early return - no relations",
+            outputs={
+                "result_chunks": [],
+                "reason": "edge_datas is empty",
+                "note": "No relationships provided, returning empty list",
+            },
+            level="info",
+        )
         return []
 
     # Step 1: Collect all text chunks for each relationship
@@ -5446,6 +5952,15 @@ async def _find_related_text_unit_from_relations(
 
     if not relations_with_chunks:
         logger.warning("No relation-related chunks found")
+        wnc_log(
+            purpose="[OUTPUT] _find_related_text_unit_from_relations early return - no chunks in relations",
+            outputs={
+                "result_chunks": [],
+                "reason": "no relationships with source_id chunks found",
+                "note": "All relationships lack source_id field or have empty source_id",
+            },
+            level="info",
+        )
         return []
 
     kg_chunk_pick_method = text_chunks_db.global_config.get(
@@ -5501,6 +6016,16 @@ async def _find_related_text_unit_from_relations(
     if not relations_with_chunks:
         logger.info(
             f"Find no additional relations-related chunks from {len(edge_datas)} relations"
+        )
+        wnc_log(
+            purpose="[OUTPUT] _find_related_text_unit_from_relations early return - all chunks deduplicated",
+            outputs={
+                "result_chunks": [],
+                "reason": "all relation chunks already exist in entity_chunks",
+                "deduplicated_count": len(removed_entity_chunk_ids),
+                "note": "All chunks from relations were duplicates of entity chunks",
+            },
+            level="info",
         )
         return []
 
@@ -5573,6 +6098,16 @@ async def _find_related_text_unit_from_relations(
     )
 
     if not selected_chunk_ids:
+        wnc_log(
+            purpose="[OUTPUT] _find_related_text_unit_from_relations early return - no chunks selected",
+            outputs={
+                "result_chunks": [],
+                "reason": "chunk selection algorithm returned empty list",
+                "kg_chunk_pick_method": kg_chunk_pick_method,
+                "note": "Either WEIGHT or VECTOR method failed to select any chunks",
+            },
+            level="info",
+        )
         return []
 
     # Step 5: Batch retrieve chunk data
@@ -5598,6 +6133,16 @@ async def _find_related_text_unit_from_relations(
                     "order": i + 1,  # 1-based order in final relation-related results
                 }
 
+    wnc_log(
+        purpose="[OUTPUT] _find_related_text_unit_from_relations success",
+        outputs={
+            "result_chunks": result_chunks,
+            "kg_chunk_pick_method": kg_chunk_pick_method,
+            "deduplicated_against_entities": len(removed_entity_chunk_ids) if 'removed_entity_chunk_ids' in locals() else 0,
+            "note": f"Selected {len(result_chunks)} additional chunks from {len(edge_datas)} relations using {kg_chunk_pick_method} method, after deduplicating against entity chunks",
+        },
+        level="info",
+    )
     return result_chunks
 
 

@@ -113,15 +113,31 @@ Examples of early returns:
 
 ### 1. `purpose` (required)
 
+**CRITICAL RULE: Read the entire code block before writing purpose**
+
+Before writing the `purpose` field, you MUST:
+1. Read the entire function body from beginning to end
+2. Understand what it actually does (not just what the docstring says)
+3. Identify the key transformation or action it performs
+4. Write purpose based on actual code behavior, not assumptions
+
+**Why this matters:**
+- Prevents inaccurate descriptions based on function names alone
+- Ensures purpose reflects actual implementation
+- Catches edge cases and special behaviors
+- Example: A function named "get_related_entities" might actually "extracts unique entity endpoints from pre-ranked relationships" - very different!
+
 **For initial log:**
 - 1 sentence, present tense, user-facing
 - Describe what the function does and why it exists
 - Prefer docstring/comments/type hints
 - Avoid vague phrasing like "handles", "does stuff", "wrapper"
+- **Must be based on actual code reading, not assumptions**
 
 **Examples:**
 - Good: "Generates deterministic unique ID by computing MD5 hash of content and prepending prefix"
 - Bad: "Handles ID generation stuff"
+- Bad: "Gets related entities" (too vague - what does "get" mean? How are they "related"?)
 
 **For output log:**
 - Use format: `"[OUTPUT] Brief description"`
@@ -245,6 +261,7 @@ Add when it provides value beyond purpose:
 - Assumptions (sync vs async, thread/event-loop constraints)
 - Non-obvious performance implications
 - Possible other branches/routes
+- **X-step process breakdown for complex functions** (see below)
 
 **Format:**
 ```python
@@ -256,6 +273,55 @@ note="Has 3 branches: cache hit (read only), cache miss (read + write), cache di
 **Rules:**
 - 0-3 short bullet-like sentences
 - No repetition of purpose
+
+#### Special Pattern: X-Step Process Breakdown
+
+**When to use:**
+For functions with multiple distinct stages or steps, add an "X-step process" summary to help readers understand the flow at a glance.
+
+**Format:**
+```python
+note="5-step process: (1) Rerank if enabled, (2) Filter by min_rerank_score, (3) Apply chunk_top_k, (4) Token truncation, (5) Add DC IDs.\n"
+     "Returns final chunks ready for LLM context with id field."
+```
+
+**Examples:**
+
+1. **Chunk processing (5 steps):**
+```python
+note="5-step process: (1) Rerank if enabled, (2) Filter by min_rerank_score, (3) Apply chunk_top_k, (4) Token truncation, (5) Add DC IDs.\n"
+     "Returns final chunks ready for LLM context with id field."
+```
+
+2. **Reference generation (5 steps):**
+```python
+note="5-step process: (1) Extract and count file_paths, (2) Sort by frequency desc then first appearance, (3) Map file_path to reference_id, (4) Add reference_id to chunks, (5) Build reference_list.\n"
+     "Reference IDs are assigned by file_path frequency (most frequent = '1')."
+```
+
+3. **Entity chunk selection (6 steps):**
+```python
+note="6-step process: (1) Extract chunk IDs from source_id, (2) Count occurrences and dedupe, (3) Sort by occurrence, (4) Select via WEIGHT or VECTOR, (5) Batch retrieve content, (6) Build results with tracking.\n"
+     "WEIGHT method: weighted polling based on chunk frequency across entities.\n"
+     "VECTOR method: ranks by similarity to query."
+```
+
+4. **Pipeline stages (4 steps):**
+```python
+note="_build_query_context() uses 4-stage pipeline:\n"
+     "Stage 1 (_perform_kg_search) returns vector_chunks from naive vector similarity search.\n"
+     "Stage 2 (_apply_token_truncation) filters entities/relations by token limits.\n"
+     "Stage 3 (_merge_all_chunks - THIS FUNCTION) fetches text chunks from entities/relations.\n"
+     "Stage 4 (_build_context_str) builds final LLM context with reranking and formatting."
+```
+
+**Guidelines for X-step breakdown:**
+- Use when function has 3+ distinct steps
+- Number each step clearly: (1), (2), (3)...
+- Keep each step to 5-10 words
+- Use action verbs: Extract, Count, Sort, Select, Build, etc.
+- Place at beginning of note field for visibility
+- Add additional context after the step breakdown if needed
 
 ### 6. `level` (required)
 
@@ -633,10 +699,82 @@ async def use_llm_func_with_cache(
 
 ---
 
+## Critical Rule: Do NOT Change Existing Code
+
+**⚠️ CRITICAL RULE: When adding WNC logging, you must ONLY insert `wnc_log()` calls. Do NOT change any existing code.**
+
+### What This Means:
+
+❌ **DON'T:**
+- Modify existing return statements
+- Create new intermediate variables to store return values
+- Restructure code logic or control flow
+- Change existing expressions or calculations
+
+✅ **DO:**
+- Insert `wnc_log()` calls immediately before return statements
+- Use inline expressions in wnc_log calls if needed
+- Duplicate expressions from return statements in outputs dict if necessary
+
+### Examples:
+
+❌ **WRONG - Creating new variable:**
+```python
+# BAD - Changed existing code by creating 'result' variable
+def compute_hash(text):
+    result = md5(text.encode("utf-8")).hexdigest()
+    wnc_log(purpose="[OUTPUT]", outputs={"hash": result})
+    return result
+```
+
+✅ **CORRECT - Only added wnc_log:**
+```python
+# GOOD - Only inserted wnc_log, existing return unchanged
+def compute_hash(text):
+    wnc_log(
+        purpose="[OUTPUT] compute_hash completed",
+        outputs={"hash": md5(text.encode("utf-8")).hexdigest()}
+    )
+    return md5(text.encode("utf-8")).hexdigest()
+```
+
+❌ **WRONG - Modified return statement:**
+```python
+# BAD - Changed the return statement structure
+def get_embeddings(texts):
+    result = np.array([...])
+    wnc_log(purpose="[OUTPUT]", outputs={"embeddings": result})
+    return result
+```
+
+✅ **CORRECT - Only added wnc_log:**
+```python
+# GOOD - Original return statement unchanged
+def get_embeddings(texts):
+    wnc_log(
+        purpose="[OUTPUT] openai_embed - embeddings generated",
+        outputs={"embeddings": np.array([...])}
+    )
+    return np.array([...])
+```
+
+### Why This Rule Exists:
+
+1. **Preserves original logic** - No risk of introducing bugs
+2. **Minimal code changes** - Only additive changes (logging)
+3. **Easy to review** - Clear that only logging was added
+4. **Safe rollback** - Can remove wnc_log calls without affecting functionality
+
+**This rule applies to ALL WNC logging additions across the entire codebase.**
+
+---
+
 ## Quick Checklist
 
 When adding `wnc_log` to a function:
 
+- [ ] **CRITICAL:** Read the ENTIRE function code before writing `purpose`
+- [ ] **CRITICAL:** Do NOT change existing code - only insert wnc_log() calls
 - [ ] Import: `from lightrag.wnc.wnc_logging import wnc_log`
 - [ ] Initial log at the beginning with `purpose`, `inputs`, `side_effects`, `note`
 - [ ] Set `outputs=None` if function doesn't return a value
@@ -648,6 +786,7 @@ When adding `wnc_log` to a function:
 - [ ] Only use underscores for pre-defined variable names: `track_id`, `arg_hash`
 - [ ] Describe actual behavior, not implementation details in `purpose`
 - [ ] Be concrete and specific in `side_effects`
+- [ ] For complex functions (3+ steps), add X-step process breakdown in `note`
 
 ---
 

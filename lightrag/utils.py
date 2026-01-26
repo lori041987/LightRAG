@@ -566,16 +566,48 @@ def compute_args_hash(*args: Any) -> str:
     Returns:
         str: Hash string
     """
+    # [WNC] Initial log
+    wnc_log(
+        purpose="Compute MD5 hash from arguments for cache key generation",
+        inputs={
+            "args_count": len(args),
+            "args_preview": str(args)[:200] if args else "empty",
+        },
+        side_effects="None (pure function)",
+        note="Used by handle_cache and save_to_cache to create cache keys. Handles Unicode encoding errors gracefully.",
+        level="trace",
+    )
+
     # Convert all arguments to strings and join them
     args_str = "".join([str(arg) for arg in args])
 
     # Use 'replace' error handling to safely encode problematic Unicode characters
     # This replaces invalid characters with Unicode replacement character (U+FFFD)
     try:
+        # [WNC] Output log - normal path
+        wnc_log(
+            purpose="[OUTPUT] compute_args_hash - normal encoding",
+            outputs={
+                "hash": md5(args_str.encode("utf-8")).hexdigest(),
+                "encoding": "utf-8",
+                "note": "Successfully encoded without errors",
+            },
+            level="trace",
+        )
         return md5(args_str.encode("utf-8")).hexdigest()
     except UnicodeEncodeError:
         # Handle surrogate characters and other encoding issues
         safe_bytes = args_str.encode("utf-8", errors="replace")
+        # [WNC] Output log - error handling path
+        wnc_log(
+            purpose="[OUTPUT] compute_args_hash - fallback encoding",
+            outputs={
+                "hash": md5(safe_bytes).hexdigest(),
+                "encoding": "utf-8 with errors='replace'",
+                "note": "UnicodeEncodeError caught, used safe encoding with replacement characters",
+            },
+            level="trace",
+        )
         return md5(safe_bytes).hexdigest()
 
 
@@ -2995,13 +3027,47 @@ async def apply_rerank_if_enabled(
     Returns:
         Reranked documents if rerank is enabled, otherwise original documents
     """
+    wnc_log(
+        purpose="Calls rerank_model_func if enabled to reorder chunks by relevance score, adding rerank_score to each chunk",
+        inputs={
+            "query": query,
+            "num_retrieved_docs": len(retrieved_docs),
+            "enable_rerank": enable_rerank,
+            "top_n": top_n,
+        },
+        side_effects="Calls rerank_model_func (external reranking API/model) if enabled and configured.\n"
+                    "Adds 'rerank_score' field to each returned chunk.",
+        note="4-step process: (1) Validation checks for enable/docs/func, (2) Extract document texts, (3) Call rerank_model_func, (4) Process results and add scores.\n"
+             "Called by process_chunks_unified.\n"
+             "Supports both index-based format and legacy document format from reranker.\n"
+             "Returns original docs on early exit (disabled, no func, exception).",
+        level="info",
+    )
     if not enable_rerank or not retrieved_docs:
+        wnc_log(
+            purpose="[OUTPUT] apply_rerank_if_enabled early return - disabled or no docs",
+            outputs={
+                "reranked_docs": retrieved_docs,
+                "reason": f"enable_rerank={enable_rerank}, num_docs={len(retrieved_docs)}",
+                "note": "Reranking skipped, returning original documents",
+            },
+            level="info",
+        )
         return retrieved_docs
 
     rerank_func = global_config.get("rerank_model_func")
     if not rerank_func:
         logger.warning(
             "Rerank is enabled but no rerank model is configured. Please set up a rerank model or set enable_rerank=False in query parameters."
+        )
+        wnc_log(
+            purpose="[OUTPUT] apply_rerank_if_enabled early return - no rerank function",
+            outputs={
+                "reranked_docs": retrieved_docs,
+                "reason": "rerank_model_func not configured in global_config",
+                "note": "Reranking requested but model not available, returning original documents",
+            },
+            level="info",
         )
         return retrieved_docs
 
@@ -3045,17 +3111,52 @@ async def apply_rerank_if_enabled(
                 logger.info(
                     f"Successfully reranked: {len(reranked_docs)} chunks from {len(retrieved_docs)} original chunks"
                 )
+                wnc_log(
+                    purpose="[OUTPUT] apply_rerank_if_enabled success - index format",
+                    outputs={
+                        "reranked_docs": reranked_docs,
+                        "note": f"Reranked {len(reranked_docs)} chunks from {len(retrieved_docs)} original using index-based format",
+                    },
+                    level="info",
+                )
                 return reranked_docs
             else:
                 # Legacy format: assume it's already reranked documents
                 logger.info(f"Using legacy rerank format: {len(rerank_results)} chunks")
-                return rerank_results[:top_n] if top_n else rerank_results
+                final_results = rerank_results[:top_n] if top_n else rerank_results
+                wnc_log(
+                    purpose="[OUTPUT] apply_rerank_if_enabled success - legacy format",
+                    outputs={
+                        "reranked_docs": final_results,
+                        "note": f"Using legacy rerank format: {len(final_results)} chunks",
+                    },
+                    level="info",
+                )
+                return final_results
         else:
             logger.warning("Rerank returned empty results, using original chunks")
+            wnc_log(
+                purpose="[OUTPUT] apply_rerank_if_enabled fallback - empty results",
+                outputs={
+                    "reranked_docs": retrieved_docs,
+                    "reason": "rerank_func returned empty results",
+                    "note": "Reranker returned no results, falling back to original documents",
+                },
+                level="info",
+            )
             return retrieved_docs
 
     except Exception as e:
         logger.error(f"Error during reranking: {e}, using original chunks")
+        wnc_log(
+            purpose="[OUTPUT] apply_rerank_if_enabled fallback - exception",
+            outputs={
+                "reranked_docs": retrieved_docs,
+                "reason": f"exception during reranking: {str(e)}",
+                "note": "Reranking failed with exception, falling back to original documents",
+            },
+            level="info",
+        )
         return retrieved_docs
 
 
@@ -3081,7 +3182,34 @@ async def process_chunks_unified(
     Returns:
         Processed and filtered list of text chunks
     """
+    wnc_log(
+        purpose="Applies reranking (if enabled), enforces chunk_top_k limit, token-truncates chunks, adds sequential DC IDs",
+        inputs={
+            "query": query,
+            "unique_chunks": unique_chunks,
+            "enable_rerank": query_param.enable_rerank,
+            "chunk_top_k": query_param.chunk_top_k,
+            "chunk_token_limit": chunk_token_limit,
+            "source_type": source_type,
+        },
+        side_effects="Calls apply_rerank_if_enabled (may call rerank_model_func).\n"
+                    "Calls truncate_list_by_token_size using tokenizer.\n"
+                    "Modifies chunks by adding 'id' field (DC1, DC2, etc.).",
+        note="Called by _build_context_str.\n"
+             "5-step process: (1) Rerank if enabled, (2) Filter by min_rerank_score, (3) Apply chunk_top_k, (4) Token truncation, (5) Add DC IDs.\n"
+             "Returns final chunks ready for LLM context with id field.",
+        level="info",
+    )
     if not unique_chunks:
+        wnc_log(
+            purpose="[OUTPUT] process_chunks_unified early return - no chunks",
+            outputs={
+                "final_chunks": [],
+                "reason": "unique_chunks is empty",
+                "note": "No chunks to process",
+            },
+            level="info",
+        )
         return []
 
     origin_count = len(unique_chunks)
@@ -3120,6 +3248,16 @@ async def process_chunks_unified(
                     f"Rerank filtering: {len(unique_chunks)} chunks remained (min rerank score: {min_rerank_score})"
                 )
             if not unique_chunks:
+                wnc_log(
+                    purpose="[OUTPUT] process_chunks_unified early return - filtered by rerank score",
+                    outputs={
+                        "final_chunks": [],
+                        "reason": f"all chunks filtered out by min_rerank_score={min_rerank_score}",
+                        "filtered_count": filtered_count,
+                        "note": "All chunks had rerank_score below threshold",
+                    },
+                    level="info",
+                )
                 return []
 
     # 3. Apply chunk_top_k limiting if specified
@@ -3165,6 +3303,14 @@ async def process_chunks_unified(
         chunk_with_id["id"] = f"DC{i + 1}"
         final_chunks.append(chunk_with_id)
 
+    wnc_log(
+        purpose="[OUTPUT] process_chunks_unified success",
+        outputs={
+            "final_chunks": final_chunks,
+            "note": f"Processed {origin_count} original chunks into {len(final_chunks)} final chunks with DC IDs (rerank={query_param.enable_rerank}, chunk_top_k={query_param.chunk_top_k})",
+        },
+        level="info",
+    )
     return final_chunks
 
 
@@ -3551,6 +3697,25 @@ def convert_to_user_format(
 ) -> dict[str, Any]:
     """Convert internal data format to user-friendly format using original database data"""
 
+    wnc_log(
+        purpose="Converts internal LLM context structures into user-friendly raw_data dict with complete database properties (entity_name, description, source_id, created_at, etc.)",
+        inputs={
+            "entities_context": entities_context,
+            "relations_context": relations_context,
+            "chunks": chunks,
+            "references": references,
+            "query_mode": query_mode,
+        },
+        side_effects="None - pure data transformation",
+        note="Called by _build_context_str.\n"
+             "Uses entity_id_to_original and relation_id_to_original mappings to restore full database properties.\n"
+             "Returns dict: {status, message, data: {entities, relationships, chunks, references}, metadata: {query_mode, keywords}}.\n"
+             "Example entity: {entity_name, entity_type, description, source_id, file_path, created_at}.\n"
+             "Example relationship: {src_id, tgt_id, description, keywords, weight, source_id, file_path, created_at}.\n"
+             "Example chunk: {reference_id, content, file_path, chunk_id}.",
+        level="info",
+    )
+
     # Convert entities format using original data when available
     formatted_entities = []
     for entity in entities_context:
@@ -3651,6 +3816,19 @@ def convert_to_user_format(
         },  # Placeholder, will be set by calling functions
     }
 
+    wnc_log(
+        purpose="[OUTPUT] convert_to_user_format success",
+        outputs={
+            "formatted_entities": formatted_entities,
+            "formatted_relationships": formatted_relationships,
+            "formatted_chunks": formatted_chunks,
+            "references": references,
+            "metadata": metadata,
+            "note": f"Converted to user format: {len(formatted_entities)} entities, {len(formatted_relationships)} relationships, {len(formatted_chunks)} chunks, {len(references)} references",
+        },
+        level="info",
+    )
+
     return {
         "status": "success",
         "message": "Query processed successfully",
@@ -3682,7 +3860,29 @@ def generate_reference_list_from_chunks(
             - reference_list: List of dicts with reference_id and file_path
             - updated_chunks_with_reference_ids: Original chunks with reference_id field added
     """
+    wnc_log(
+        purpose="Assigns reference_ids (1, 2, 3...) to file_paths by frequency/order, adds reference_id field to each chunk, builds reference list",
+        inputs={
+            "chunks": chunks,
+        },
+        side_effects="None - pure data transformation",
+        note="Called by _build_context_str.\n"
+             "5-step process: (1) Extract and count file_paths, (2) Sort by frequency desc then first appearance, (3) Map file_path to reference_id, (4) Add reference_id to chunks, (5) Build reference_list.\n"
+             "Reference IDs are assigned by file_path frequency (most frequent = '1').\n"
+             "Returns tuple: (reference_list, updated_chunks_with_reference_ids).",
+        level="info",
+    )
     if not chunks:
+        wnc_log(
+            purpose="[OUTPUT] generate_reference_list_from_chunks early return - no chunks",
+            outputs={
+                "reference_list": [],
+                "updated_chunks": [],
+                "reason": "chunks is empty",
+                "note": "No chunks to process",
+            },
+            level="info",
+        )
         return [], []
 
     # 1. Extract all valid file_paths and count their occurrences
@@ -3727,4 +3927,13 @@ def generate_reference_list_from_chunks(
     for i, file_path in enumerate(unique_file_paths):
         reference_list.append({"reference_id": str(i + 1), "file_path": file_path})
 
+    wnc_log(
+        purpose="[OUTPUT] generate_reference_list_from_chunks success",
+        outputs={
+            "reference_list": reference_list,
+            "updated_chunks": updated_chunks,
+            "note": f"Generated {len(reference_list)} references from {len(chunks)} chunks (unique file_paths sorted by frequency)",
+        },
+        level="info",
+    )
     return reference_list, updated_chunks

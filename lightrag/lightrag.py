@@ -462,7 +462,7 @@ class LightRAG:
             outputs=None,
             side_effects="Creates working_dir if it does not exist; instantiates storage objects (does not load data until initialize_storages is called)",
             note="Validates storage backend compatibility and environment variables; wraps embedding_func with priority_limit_async_func_call for concurrency control; deprecated log_level/log_file_path parameters are removed after warning",
-            level="trace"
+            level="info"
         )
 
         # Handle deprecated parameters
@@ -2754,8 +2754,26 @@ class LightRAG:
         Returns:
             str: The result of the query execution.
         """
+        wnc_log(
+            purpose="Synchronous wrapper around async query pipeline that runs aquery in an event loop and returns either a string answer or a streaming iterator",
+            inputs={
+                "query": query,
+                "mode": param.mode,
+                "stream": param.stream,
+                "system_prompt": system_prompt if system_prompt else "None (uses default)",
+            },
+            side_effects="Delegates to async pipeline via aquery which performs storage reads, LLM calls, and optional cache operations",
+            note="Returns str for non-streaming queries, Iterator[str] for streaming queries.\n"
+                 "Creates or reuses an event loop via always_get_an_event_loop.",
+            level="info",
+        )
         loop = always_get_an_event_loop()
 
+        wnc_log(
+            purpose="[OUTPUT] LightRAG.query calling aquery",
+            outputs={"delegating to": "aquery"},
+            level="info",
+        )
         return loop.run_until_complete(self.aquery(query, param, system_prompt))  # type: ignore
 
     async def aquery(
@@ -2781,6 +2799,19 @@ class LightRAG:
                 - Non-streaming: Returns str
                 - Streaming: Returns AsyncIterator[str]
         """
+        wnc_log(
+            purpose="Backward-compatible async wrapper around aquery_llm that extracts and returns only the LLM response content",
+            inputs={
+                "query": query,
+                "mode": param.mode,
+                "stream": param.stream,
+                "system_prompt": system_prompt if system_prompt else "None (uses default)",
+            },
+            side_effects="Delegates to aquery_llm which performs retrieval (storage reads), LLM calls, and optional cache operations",
+            note="Returns str for non-streaming queries, AsyncIterator[str] for streaming queries.\n"
+                 "Extracts only llm_response from aquery_llm result for backward compatibility.",
+            level="info",
+        )
         # Call the new aquery_llm function to get complete results
         result = await self.aquery_llm(query, param, system_prompt)
 
@@ -2788,8 +2819,18 @@ class LightRAG:
         llm_response = result.get("llm_response", {})
 
         if llm_response.get("is_streaming"):
+            wnc_log(
+                purpose="[OUTPUT] LightRAG.aquery streaming response",
+                outputs={"is_streaming": True},
+                level="info",
+            )
             return llm_response.get("response_iterator")
         else:
+            wnc_log(
+                purpose="[OUTPUT] LightRAG.aquery non-streaming response",
+                outputs={"is_streaming": False, "content": llm_response.get("content", "")},
+                level="info",
+            )
             return llm_response.get("content", "")
 
     def query_data(
@@ -3059,6 +3100,23 @@ class LightRAG:
         Returns:
             dict[str, Any]: Complete response with structured data and LLM response.
         """
+        wnc_log(
+            purpose="Top-level async query API that dispatches by mode to retrieval (kg_query/naive_query) or direct LLM (bypass), then returns structured data with LLM response fields",
+            inputs={
+                "query": query,
+                "mode": param.mode,
+                "stream": param.stream,
+                "enable_rerank": param.enable_rerank,
+                "system_prompt": system_prompt if system_prompt else "None (uses default)",
+            },
+            side_effects="Reads from graph/VDB/KV stores for retrieval modes (local/global/hybrid/mix/naive).\n"
+                        "Calls LLM for keywords extraction (in kg_query) and final answer generation.\n"
+                        "Optional cache read/write via llm_response_cache when enabled.",
+            note="Dispatches to kg_query for local/global/hybrid/mix modes, naive_query for naive mode, direct LLM call for bypass mode.\n"
+                 "Returns dict with status, message, data, metadata, and llm_response fields.\n"
+                 "Wraps operation in try/except and returns failure dict on exception.",
+            level="info",
+        )
         logger.debug(f"[aquery_llm] Query param: {param}")
 
         # [WNC] Stage annotation: query with LLM generation always uses LLM; most modes also
@@ -3125,6 +3183,11 @@ class LightRAG:
                     stream=param.stream,
                 )
                 if type(response) is str:
+                    wnc_log(
+                        purpose="[OUTPUT] LightRAG.aquery_llm bypass mode non-streaming",
+                        outputs={"status": "success", "mode": "bypass", "is_streaming": False},
+                        level="info",
+                    )
                     return {
                         "status": "success",
                         "message": "Bypass mode LLM non streaming response",
@@ -3137,6 +3200,11 @@ class LightRAG:
                         },
                     }
                 else:
+                    wnc_log(
+                        purpose="[OUTPUT] LightRAG.aquery_llm bypass mode streaming",
+                        outputs={"status": "success", "mode": "bypass", "is_streaming": True},
+                        level="info",
+                    )
                     return {
                         "status": "success",
                         "message": "Bypass mode LLM streaming response",
@@ -3155,6 +3223,11 @@ class LightRAG:
 
             # Check if query_result is None
             if query_result is None:
+                wnc_log(
+                    purpose="[OUTPUT] LightRAG.aquery_llm early return - no results",
+                    outputs={"status": "failure", "reason": "query returned no results", "mode": param.mode},
+                    level="info",
+                )
                 return {
                     "status": "failure",
                     "message": "Query returned no results",
@@ -3182,11 +3255,25 @@ class LightRAG:
                 "is_streaming": query_result.is_streaming,
             }
 
+            wnc_log(
+                purpose="[OUTPUT] LightRAG.aquery_llm success",
+                outputs={
+                    "status": raw_data.get("status", "success"),
+                    "mode": param.mode,
+                    "is_streaming": query_result.is_streaming,
+                },
+                level="info",
+            )
             return raw_data
 
         except Exception as e:
             logger.error(f"Query failed: {e}")
             # Return error response
+            wnc_log(
+                purpose="[OUTPUT] LightRAG.aquery_llm exception",
+                outputs={"status": "failure", "error": str(e), "mode": param.mode},
+                level="info",
+            )
             return {
                 "status": "failure",
                 "message": f"Query failed: {str(e)}",

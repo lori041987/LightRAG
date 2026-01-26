@@ -27,6 +27,7 @@ from lightrag.utils import (
     safe_unicode_decode,
     logger,
 )
+from lightrag.wnc.wnc_logging import wnc_log
 
 from lightrag.types import GPTKeywordExtractionFormat
 from lightrag.api import __api_version__
@@ -268,6 +269,28 @@ async def openai_complete_if_cache(
         RateLimitError: If the OpenAI API rate limit is exceeded.
         APITimeoutError: If the OpenAI API request times out.
     """
+    wnc_log(
+        purpose="Sends messages (system prompt + query) to OpenAI Chat Completions API and returns LLM-generated response",
+        inputs={
+            "model": model,
+            "prompt": prompt,
+            "system_prompt": system_prompt,
+            "keyword_extraction": keyword_extraction,
+            "stream": stream,
+            "enable_cot": enable_cot,
+            "use_azure": use_azure,
+        },
+        side_effects="Network call to OpenAI API (or compatible endpoint) via openai_async_client.chat.completions.create().\n"
+                    "May update token_tracker with usage statistics (prompt_tokens, completion_tokens, total_tokens).\n"
+                    "Creates and closes AsyncOpenAI or AsyncAzureOpenAI client.",
+        note="Called by extract_keywords_only (keyword_extraction=True) and kg_query (answer generation, may stream).\n"
+             "OpenAI-compatible chat completion: (1) Calls OpenAI Chat Completions API (same API used by ChatGPT). (2) 'Chat' means you send conversation messages with roles (system/user/assistant). (3) 'Completion' means LLM generates the next response to complete the conversation.\n"
+             "When keyword_extraction=True: uses GPTKeywordExtractionFormat, returns JSON string with {high_level_keywords: [...], low_level_keywords: [...]}.\n"
+             "When stream=True: returns async generator yielding text chunks for real-time display.\n"
+             "When stream=False: returns complete response string.\n"
+             "Supports COT (Chain of Thought) with <think> tags if enable_cot=True for reasoning models.",
+        level="info",
+    )
     if history_messages is None:
         history_messages = []
 
@@ -528,6 +551,15 @@ async def openai_complete_if_cache(
                         f"Failed to close OpenAI client in streaming finally block: {client_close_error}"
                     )
 
+        wnc_log(
+            purpose="[OUTPUT] openai_complete_if_cache streaming response",
+            outputs={
+                "response_type": "async_generator",
+                "stream": True,
+                "note": "Returning async generator for streaming response - yields text chunks in real-time",
+            },
+            level="info",
+        )
         return inner()
 
     else:
@@ -611,6 +643,16 @@ async def openai_complete_if_cache(
             logger.debug(f"Response content len: {len(final_content)}")
             verbose_debug(f"Response: {response}")
 
+            wnc_log(
+                purpose="[OUTPUT] openai_complete_if_cache non-streaming response",
+                outputs={
+                    "final_content": final_content,
+                    "stream": False,
+                    "keyword_extraction": keyword_extraction,
+                    "note": "Returning complete response string (non-streaming)",
+                },
+                level="info",
+            )
             return final_content
         finally:
             # Ensure client is closed in all cases for non-streaming responses
@@ -772,6 +814,23 @@ async def openai_embed(
         RateLimitError: If the OpenAI API rate limit is exceeded.
         APITimeoutError: If the OpenAI API request times out.
     """
+    # [WNC] Initial log
+    wnc_log(
+        purpose="Generate embeddings for texts using OpenAI embeddings API",
+        inputs={
+            "texts_count": len(texts),
+            "texts": texts,
+            "model": model,
+            "use_azure": use_azure,
+            "azure_deployment": azure_deployment,
+            "embedding_dim": embedding_dim,
+            "max_token_size": max_token_size,
+        },
+        side_effects="Network call to OpenAI/Azure embeddings API; optional text truncation if max_token_size set",
+        note="Used by vector DB operations for entity/relation/chunk embeddings. Returns np.ndarray of shape (len(texts), embedding_dim).",
+        level="info",
+    )
+
     # Apply text truncation if max_token_size is provided
     if max_token_size is not None and max_token_size > 0:
         encoding = _get_tiktoken_encoding_for_model(model)
@@ -836,6 +895,25 @@ async def openai_embed(
                 "total_tokens": getattr(response.usage, "total_tokens", 0),
             }
             token_tracker.add_usage(token_counts)
+
+        # [WNC] Output log
+        wnc_log(
+            purpose="[OUTPUT] openai_embed - embeddings generated successfully",
+            outputs={
+                "embeddings": np.array(
+                    [
+                        np.array(dp.embedding, dtype=np.float32)
+                        if isinstance(dp.embedding, list)
+                        else np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
+                        for dp in response.data
+                    ]
+                ),
+                "prompt_tokens": getattr(response.usage, "prompt_tokens", 0) if hasattr(response, "usage") else "N/A",
+                "total_tokens": getattr(response.usage, "total_tokens", 0) if hasattr(response, "usage") else "N/A",
+                "note": "Successfully generated embeddings from OpenAI API",
+            },
+            level="info",
+        )
 
         return np.array(
             [
