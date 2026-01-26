@@ -5709,6 +5709,9 @@ async def _find_related_text_unit_from_entities(
                     entity_info=entities_with_chunks,
                     embedding_func=actual_embedding_func,
                     query_embedding=query_embedding,
+                    # [WNC] Get source path boost config
+                    enable_source_path_boost=text_chunks_db.global_config.get("enable_source_path_boost", False),
+                    source_path_boosts=text_chunks_db.global_config.get("source_path_boosts", []),
                 )
 
                 if selected_chunk_ids == []:
@@ -6118,6 +6121,9 @@ async def _find_related_text_unit_from_relations(
                     entity_info=relations_with_chunks,
                     embedding_func=actual_embedding_func,
                     query_embedding=query_embedding,
+                    # [WNC] Get source path boost config
+                    enable_source_path_boost=text_chunks_db.global_config.get("enable_source_path_boost", False),
+                    source_path_boosts=text_chunks_db.global_config.get("source_path_boosts", []),
                 )
 
                 if selected_chunk_ids == []:

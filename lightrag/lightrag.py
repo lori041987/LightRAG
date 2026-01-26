@@ -439,6 +439,16 @@ class LightRAG:
         default=float(os.getenv("COSINE_THRESHOLD", 0.2))
     )
 
+    # [WNC] Source path boost configuration for chunk selection
+    enable_source_path_boost: bool = field(default=False)
+    """If True, applies source path boost to chunk selection based on source_path_boosts rules."""
+
+    source_path_boosts: list[dict[str, Any]] = field(default_factory=list)
+    """List of boost rules to prioritize chunks from specific source paths.
+    Format: [{"prefix": "/path/to/dir/", "boost": 0.05}, ...]
+    Boost values are added to cosine similarity scores before ranking chunks for LLM context.
+    """
+
     ollama_server_infos: Optional[OllamaServerInfos] = field(default=None)
     """Configuration for Ollama server information."""
 

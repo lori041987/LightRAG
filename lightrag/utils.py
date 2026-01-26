@@ -43,6 +43,7 @@ from lightrag.constants import (
     SOURCE_IDS_LIMIT_METHOD_FIFO,
 )
 from lightrag.wnc import wnc_log
+from lightrag.wnc.boosting import apply_source_path_boost
 
 # Precompile regex pattern for JSON sanitization (module-level, compiled once)
 _SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
@@ -2835,6 +2836,8 @@ async def pick_by_vector_similarity(
     entity_info: list[dict[str, Any]],
     embedding_func: callable,
     query_embedding=None,
+    enable_source_path_boost: bool = False,
+    source_path_boosts: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """
     Vector similarity-based text chunk selection algorithm.
@@ -2968,6 +2971,67 @@ async def pick_by_vector_similarity(
 
         # Sort by similarity (highest first) and select top num_of_chunks
         similarities.sort(key=lambda x: x[1], reverse=True)
+
+        # [WNC] Apply source path boost if enabled (before selection)
+        if enable_source_path_boost and source_path_boosts:
+            # Fetch chunk metadata to get file_path for boost matching
+            chunk_metadata_list_for_boost = await text_chunks_storage.get_by_ids(all_chunk_ids)
+            chunk_id_to_file_path = {}
+            for chunk_data in chunk_metadata_list_for_boost:
+                if chunk_data and isinstance(chunk_data, dict):
+                    chunk_id_key = chunk_data.get("_id") or chunk_data.get("id") or chunk_data.get("chunk_id")
+                    if chunk_id_key:
+                        chunk_id_to_file_path[chunk_id_key] = chunk_data.get("file_path", "")
+
+            # Store original ranking for comparison
+            original_similarities = similarities.copy()
+
+            # Apply boost and get new ranking
+            boosted_results = apply_source_path_boost(
+                similarities=similarities,
+                item_id_to_file_path=chunk_id_to_file_path,
+                boost_rules=source_path_boosts,
+            )
+
+            # Update similarities with boosted scores (for selection below)
+            similarities = [(chunk_id, adjusted_score) for chunk_id, adjusted_score, _, _ in boosted_results]
+
+            # [WNC] Log boost comparison table
+            # Build comparison table showing ranking position changes
+            original_rank_map = {chunk_id: rank for rank, (chunk_id, _) in enumerate(original_similarities, start=1)}
+            boosted_rank_map = {chunk_id: rank for rank, (chunk_id, _) in enumerate(similarities, start=1)}
+
+            boost_comparison_table = []
+            for chunk_id, adjusted_score, raw_score, applied_boost in boosted_results:
+                position_raw = original_rank_map.get(chunk_id, 0)
+                position_boosted = boosted_rank_map.get(chunk_id, 0)
+                file_path = chunk_id_to_file_path.get(chunk_id, "unknown")
+                boost_comparison_table.append({
+                    "position_raw": position_raw,
+                    "position_boosted": position_boosted,
+                    "chunk_id": chunk_id,
+                    "raw_cosine": float(raw_score),
+                    "boost": float(applied_boost),
+                    "adjusted": float(adjusted_score),
+                    "file_path": file_path,
+                })
+
+            wnc_log(
+                purpose="[BOOST] Source path boost applied - chunk ranking position changes",
+                outputs={
+                    "boost_enabled": True,
+                    "boost_rules": source_path_boosts,
+                    "boost_comparison_table": boost_comparison_table,
+                    "note": "position_raw = original list position by cosine only (1=top), position_boosted = new list position after boost applied",
+                },
+                note="Boost values are added to raw cosine similarity scores before ranking.\n"
+                     "position_raw and position_boosted show chunk's position in sorted list (1st, 2nd, 3rd...).\n"
+                     "This is NOT related to entity 'rank' field (which is graph degree).\n"
+                     "Chunks from matching source path prefixes receive score boost.\n"
+                     "Longest matching prefix wins if multiple rules match.",
+                level="info",
+            )
+
         selected_chunks = [chunk_id for chunk_id, _ in similarities[:num_of_chunks]]
 
         logger.debug(

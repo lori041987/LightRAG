@@ -366,6 +366,9 @@ def main() -> None:
     # Get query parameters from config
     cosine_threshold = getattr(config, "cosine_threshold", 0.2)
     chunk_top_k = getattr(config, "chunk_top_k", None)
+    # [WNC] Get source path boost config
+    enable_source_path_boost = getattr(config, "enable_source_path_boost", False)
+    source_path_boosts = getattr(config, "source_path_boosts", [])
 
     rag = LightRAG(
         working_dir=working_dir,
@@ -378,6 +381,9 @@ def main() -> None:
         cosine_threshold=cosine_threshold,                  # For __post_init__
         cosine_better_than_threshold=cosine_threshold,      # For real vector DB cutoff
         chunk_top_k=chunk_top_k if chunk_top_k else 60,     # For __post_init__, the final cap is enforced in process_chunks_unified using QueryParam.chunk_top_k, therefore, we must set during QueryParam again later.
+        # [WNC] Source path boost configuration
+        enable_source_path_boost=enable_source_path_boost,
+        source_path_boosts=source_path_boosts,
     )
 
     # LightRAG requires explicit storage lifecycle management.

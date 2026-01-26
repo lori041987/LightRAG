@@ -6,8 +6,8 @@ Edit this file to change defaults instead of relying on CLI flags.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 
 @dataclass
@@ -72,13 +72,23 @@ class OpenAITestConfig:
 
     # Query parameters
     # chunk_top_k: Maximum number of text chunks sent to LLM for answer generation
-    chunk_top_k: int = 6
+    chunk_top_k: int = 5
 
     # Vector similarity threshold
     # cosine_threshold: Minimum cosine similarity score for entity/edge retrieval (0.0-1.0)
     # Higher values = stricter filtering (only very similar entities), lower recall
     # Lower values = looser filtering (more entities), higher recall but more noise
     cosine_threshold: float = 0.3
+
+    # Text chunk boost configuration (affects only chunks sent to LLM, not entities/edges)
+    # enable_source_path_boost: If True, prioritizes chunks from specific source paths
+    # source_path_boosts: List of {"prefix": "/path/", "boost": 0.05} rules
+    # Boost value is added to chunk's cosine similarity score before ranking/selection
+    # Example: chunk with 0.40 similarity + 0.05 boost = 0.45 adjusted score
+    enable_source_path_boost: bool = False
+    source_path_boosts: list[dict[str, Any]] = field(default_factory=lambda: [
+        {"prefix": "/srv/ai/LightRAG/wnc_kdb/test_json_260126/", "boost": 0.1}
+    ])
 
     # Number of documents processed concurrently during `rag.insert(...)`.
     # Set to 1 for easier-to-read logs (no interleaving).
