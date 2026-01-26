@@ -57,16 +57,29 @@ class OpenAISettings:
 
 @dataclass
 class OpenAITestConfig:
-    #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb"
+    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb"
     #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/3gpp"
-    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260123"
+    #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260123"
 
     #working_dir: str = "/srv/ai/LightRAG/rag_storage/openai_3gpp"
-    working_dir: str = "/srv/ai/LightRAG/rag_storage/test_json_260123"
+    working_dir: str = "/srv/ai/LightRAG/rag_storage/wnc_kdb"
 
     mode: Literal["naive", "local", "global", "hybrid", "mix", "bypass"] = "hybrid"
     skip_index: bool = False
-    question: str = "What is client's IP address?"
+
+    #question: str = "What is client's IP address?"
+    question: str = "What is device's IP address?"
+
+    # Query parameters
+    # chunk_top_k: Maximum number of text chunks sent to LLM for answer generation
+    chunk_top_k: int = 6
+
+    # Vector similarity threshold
+    # cosine_threshold: Minimum cosine similarity score for entity/edge retrieval (0.0-1.0)
+    # Higher values = stricter filtering (only very similar entities), lower recall
+    # Lower values = looser filtering (more entities), higher recall but more noise
+    cosine_threshold: float = 0.3
+
     # Number of documents processed concurrently during `rag.insert(...)`.
     # Set to 1 for easier-to-read logs (no interleaving).
     max_parallel_insert: int = 1

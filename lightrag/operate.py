@@ -5379,6 +5379,30 @@ async def _get_node_data(
 
     results = await entities_vdb.query(query, top_k=query_param.top_k)
 
+    # [WNC] Log entity similarity scores from vector DB
+    wnc_log(
+        purpose="[STEP 1] Vector DB query returned entities with cosine similarity scores",
+        outputs={
+            "query_text": query,
+            "num_results": len(results),
+            "cosine_threshold": entities_vdb.cosine_better_than_threshold,
+            "entity_similarities": [
+                {
+                    "entity_name": r["entity_name"],
+                    "similarity_score": r.get("distance"),
+                    "note": f"similarity_score = cosine similarity between query '{query}' and entity '{r['entity_name']}' (range: 0.0-1.0, higher=more similar)",
+                }
+                for r in results
+            ],
+        },
+        note="Only entities with cosine similarity >= cosine_threshold are returned by vector DB.\n"
+             "The 'similarity_score' field contains the cosine similarity from the vector DB (originally stored in __metrics__ as 'distance').\n"
+             "Cosine similarity measures the angle between query embedding and entity embedding vectors.\n"
+             "Values range from 0.0 (unrelated) to 1.0 (identical). Higher scores = more semantically similar.\n"
+             "Query text is converted to embedding vector, then compared against all entity embeddings in the database.",
+        level="info",
+    )
+
     if not len(results):
         wnc_log(
             purpose="[OUTPUT] _get_node_data early return - no entities found",
@@ -5399,6 +5423,35 @@ async def _get_node_data(
     nodes_dict, degrees_dict = await asyncio.gather(
         knowledge_graph_inst.get_nodes_batch(node_ids),
         knowledge_graph_inst.node_degrees_batch(node_ids),
+    )
+
+    # [WNC] Fetch connected edges for logging purposes
+    edges_dict = await knowledge_graph_inst.get_nodes_edges_batch(node_ids)
+
+    # [WNC] Log node degrees and connected edges from graph DB
+    wnc_log(
+        purpose="[STEP 2] Graph DB returned node degrees and connected edges for entities",
+        outputs={
+            "degrees_and_edges_by_entity": [
+                {
+                    "entity_name": node_id,
+                    "degree": degrees_dict.get(node_id, 0),
+                    "connected_edges": edges_dict.get(node_id, []),
+                    "note": "degree = outgoing edges + incoming edges; connected_edges = list of (source, target) tuples showing all connections",
+                }
+                for node_id in node_ids
+            ],
+        },
+        note="Degrees computed by knowledge_graph_inst.node_degrees_batch().\n"
+             "Edges fetched by knowledge_graph_inst.get_nodes_edges_batch().\n"
+             "Degree = count of ALL edges connected to this node (outgoing + incoming).\n"
+             "  - Outgoing edge: node is the SOURCE (node -> other)\n"
+             "  - Incoming edge: node is the TARGET (other -> node)\n"
+             "  - Example: If entity A has 3 outgoing and 2 incoming edges, degree = 5.\n"
+             "Each edge tuple shows (source_node_id, target_node_id) - includes both directions.\n"
+             "Degree will be used as 'rank' field in final node_datas.\n"
+             "Higher degree = more connected entity = higher centrality in knowledge graph.",
+        level="info",
     )
 
     # Now, if you need the node data and degree in order:

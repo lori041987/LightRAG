@@ -2853,11 +2853,47 @@ async def pick_by_vector_similarity(
     Returns:
         List of selected text chunk IDs sorted by similarity (highest first)
     """
+    # [WNC] Log function entry with inputs
+    from lightrag.wnc import wnc_log
+
+    wnc_log(
+        purpose="Selects text chunks from entity_info['sorted_chunks'] by computing cosine similarity between query embedding and each chunk embedding, then returns top num_of_chunks ranked by similarity",
+        inputs={
+            "query": query,
+            "num_of_chunks": num_of_chunks,
+            "entity_info count": len(entity_info) if entity_info else 0,
+            "entity_info": [
+                {
+                    "entity_name": entity.get("entity_name", "unknown"),
+                    "sorted_chunks": entity.get("sorted_chunks", []),
+                }
+                for entity in (entity_info if entity_info else [])
+            ],
+            "query_embedding": "provided" if query_embedding is not None else "will compute",
+        },
+        side_effects="Reads from chunks_vdb via get_vectors_by_ids to retrieve chunk embeddings.\n"
+                    "Reads from text_chunks_storage via get_by_ids to retrieve chunk metadata (file_path, tokens).\n"
+                    "May call embedding_func if query_embedding not provided.",
+        note="4-step process: (1) Collect unique chunk IDs from entity_info[...]['sorted_chunks'] lists, (2) Get embeddings and compute cosine similarity for each chunk, (3) Sort by similarity descending, (4) Select top num_of_chunks.\n"
+             "Returns empty list if entity_info is empty or num_of_chunks <= 0.\n"
+             "Cosine similarity range: 0.0 (unrelated) to 1.0 (identical), higher = more similar.",
+        level="info",
+    )
+
     logger.debug(
         f"Vector similarity chunk selection: num_of_chunks={num_of_chunks}, entity_info_count={len(entity_info) if entity_info else 0}"
     )
 
     if not entity_info or num_of_chunks <= 0:
+        # [WNC] Log early return for edge case
+        wnc_log(
+            purpose="[OUTPUT] pick_by_vector_similarity early return - no entity_info or invalid num_of_chunks",
+            outputs={
+                "selected_chunk_ids": [],
+                "reason": "entity_info is empty" if not entity_info else "num_of_chunks <= 0",
+            },
+            level="info",
+        )
         return []
 
     # Collect all unique chunk IDs from entity info
@@ -2936,6 +2972,46 @@ async def pick_by_vector_similarity(
 
         logger.debug(
             f"Vector similarity chunk selection: {len(selected_chunks)} chunks from {len(all_chunk_ids)} candidates"
+        )
+
+        # [WNC] Fetch chunk metadata to include file_path and tokens in output log
+        chunk_metadata_list = await text_chunks_storage.get_by_ids(all_chunk_ids)
+
+        # [WNC] Convert list to dict keyed by chunk_id for easy lookup
+        chunk_metadata_dict = {}
+        for chunk_data in chunk_metadata_list:
+            if chunk_data and isinstance(chunk_data, dict):
+                # Try multiple possible ID field names (_id is set by JsonKVStorage.get_by_ids)
+                chunk_id_key = chunk_data.get("_id") or chunk_data.get("id") or chunk_data.get("chunk_id")
+                if chunk_id_key:
+                    chunk_metadata_dict[chunk_id_key] = chunk_data
+
+        # [WNC] Build ranked list with metadata for each chunk
+        chunk_ranked_similarities = []
+        for rank, (chunk_id, similarity_score) in enumerate(similarities, start=1):
+            chunk_data = chunk_metadata_dict.get(chunk_id, {})
+            chunk_ranked_similarities.append({
+                "rank": rank,
+                "chunk_id": chunk_id,
+                "similarity_score": float(similarity_score),
+                "file_path": chunk_data.get("file_path", "unknown"),
+                "tokens": chunk_data.get("tokens", 0),
+                "selected": rank <= num_of_chunks,
+            })
+
+        # [WNC] Log output with detailed chunk rankings
+        wnc_log(
+            purpose="[OUTPUT] pick_by_vector_similarity completed - chunks ranked by cosine similarity",
+            outputs={
+                "selected_chunk_ids": selected_chunks,
+                "chunk_ranked_similarities": chunk_ranked_similarities,
+                "selected count": len(selected_chunks),
+                "candidate count": len(similarities),
+            },
+            note=f"Top {len(selected_chunks)} chunks selected from {len(similarities)} candidates.\n"
+                 "Field 'selected' indicates if chunk was in final selection (rank <= num_of_chunks).\n"
+                 "similarity_score is cosine similarity between query and chunk (0.0-1.0, higher=more similar).",
+            level="info",
         )
 
         return selected_chunks

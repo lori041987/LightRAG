@@ -363,6 +363,10 @@ def main() -> None:
             api_version=config.openai.api_version,
         )
 
+    # Get query parameters from config
+    cosine_threshold = getattr(config, "cosine_threshold", 0.2)
+    chunk_top_k = getattr(config, "chunk_top_k", None)
+
     rag = LightRAG(
         working_dir=working_dir,
         llm_model_func=llm_model_func,
@@ -371,6 +375,9 @@ def main() -> None:
         max_parallel_insert=int(getattr(config, "max_parallel_insert", 2)),
         enable_llm_cache=config.enable_llm_cache,
         enable_llm_cache_for_entity_extract=config.enable_llm_cache_for_entity_extract,
+        cosine_threshold=cosine_threshold,                  # For __post_init__
+        cosine_better_than_threshold=cosine_threshold,      # For real vector DB cutoff
+        chunk_top_k=chunk_top_k if chunk_top_k else 60,     # For __post_init__, the final cap is enforced in process_chunks_unified using QueryParam.chunk_top_k, therefore, we must set during QueryParam again later.
     )
 
     # LightRAG requires explicit storage lifecycle management.
@@ -587,7 +594,10 @@ def main() -> None:
         else:
             with phase("Query"):
                 logger.info("Question:\n%s", question.strip())
-                answer = rag.query(question, param=QueryParam(mode=mode))
+                query_param = QueryParam(mode=mode)
+                if chunk_top_k is not None:
+                    query_param.chunk_top_k = int(chunk_top_k)
+                answer = rag.query(question, param=query_param)
 
         logger.info("Question:\n%s", question.strip())
         logger.info("Answer:\n%s", answer)
