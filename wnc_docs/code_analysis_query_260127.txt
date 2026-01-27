@@ -1,4 +1,4 @@
-• - ## 0. Entry points (Summary)
+  - ## 0. Entry points (Summary)
       - Python (package)
           - Function/class name (entry point): main
           - Code location: wnc_scripts/openai_test.py:95
@@ -1065,3 +1065,288 @@
       - Outputs: np.ndarray
       - Side effects (files/network/storage): Network embeddings request.
       - Errors/edge cases: Retries on rate limit/connection/timeout (decorator).
+
+
+
+  - ## Note A: What is KG stand for?
+
+  KG stands for Knowledge Graph.                                                                                                                                      
+                                                                                                                                                                      
+  In this codebase, the knowledge graph consists of:                                                                                                                  
+  - Entities (nodes): Things extracted from documents (people, places, concepts, etc.)                                                                                
+  - Relations (edges): Connections between entities                                                                                                                   
+  - Text chunks: The original text that mentions these entities/relations                                                                                             
+                                                                                                                                                                      
+  So _perform_kg_search means "perform knowledge graph search" - it searches the graph structure to find relevant entities and relationships based on the query       
+  keywords.
+
+
+  - ## Note B: What is the degree means in graph? How do the computing work?
+
+  In _get_node_data(), 
+  purpose="Local-mode retrieval that queries entity vector database by keywords, fetches node records and connection counts (degrees) from graph for ranking, then computes most related edges"
+
+
+  In graph theory, degree refers to the number of connections (edges) a node has.
+                                                                                                                                                                      
+  Looking at the code:                                                                                                                                                
+  - node_degrees_batch(node_ids) returns how many edges are connected to each entity node
+  - For example, if entity "Alice" is connected to 5 other entities, Alice's degree is 5                                                                              
+                                                                                                                                                                      
+  The degree is used for ranking - entities with more connections are considered more important in the knowledge graph. Later in the code, you can see it's used in the rank field:
+                                                                                                                                                                      
+  node_datas = [
+      {
+          **n,
+          "entity_name": k["entity_name"],
+          "rank": d,  # d is the degree
+          "created_at": k.get("created_at"),
+      }      for k, n, d in zip(results, node_datas, node_degrees)
+      if n is not None
+  ]                                                                                                                                                                   
+                                                                                                                                                                      
+  So the "computing" is:
+  1. Query vector DB to find similar entities
+  2. For each entity found, get its node data AND its degree (connection count) from the graph
+  3. Use the degree as a rank indicator - higher degree = more important/central entity
+                                                                                                                                                                      
+
+  - ## Note C: What is the "Cosine Similarity" means in graph? How does "weight" calcualted?
+
+  ### Cosine Similarity                                                                                                                                                   
+  Cosine here refers to cosine similarity, not the trigonometric function directly, but it does use the cosine concept!
+                                                                                                                                                                      
+  When text is converted to embeddings (vectors of numbers), we can measure how similar two pieces of text are by calculating the angle between their vectors:
+                                                                                                                                                                      
+  - Cosine similarity = cosine of the angle between two vectors
+  - Value ranges from -1 to 1 (in practice usually 0 to 1 for embeddings)
+  - 1.0 = identical/very similar (0° angle)
+  - 0.0 = completely unrelated (90° angle)
+                                                                                                                                                                      
+  So when the code searches entities_vdb (entity vector database), it finds entities whose embeddings have the smallest angle (highest cosine similarity) to the query embedding.
+                                                                                                                                                                      
+  ### Weight                                                                                                                                                              
+                                                                                                                                                                      
+  Looking at the code, weight is a property stored on each relationship/edge in the knowledge graph.
+                                                                                                                                                                      
+  Yes, it's decided during the indexing stage! When documents are processed:
+  1. LLM extracts entities and relationships
+  2. Each relationship can have a weight value (often representing importance, frequency, or confidence)
+  3. This weight is stored in the graph
+                                                                                                                                                                      
+  For example:                                                                                                                                                        
+  {                                                                                                                                                                   
+    "src_id": "Alice",
+    "tgt_id": "Company",
+    "relation": "works_at",
+    "weight": 0.95  # High confidence/strong relationship
+  }                                                                                                                                                                   
+                                                                                                                                                                      
+  The code uses rank + weight to sort relations, where:
+  - rank = degree (connection count)
+  - weight = stored relationship strength from indexing
+
+  - ## Note D: 
+
+  I was told: When text is converted to embeddings (vectors of numbers), so we can measure how similar two pieces of text are by calculating the angle between their vectors.
+
+  But how does text become a vector after converted to embeddings?
+  As far as I know, the vector endpoint is the target text, then what is the vector ori-point?
+
+
+  ### ANS: An embedding model is a learned function that maps text to a point in a high‑dimensional vector space:
+
+  - Text → numbers: The model tokenizes your text, runs it through a neural network (typically a Transformer), and outputs a fixed‑length numeric array like x ∈ R^d (e.g., d=1536). Those d numbers are the coordinates of the text in that space. The coordinate system is implicitly defined by the model’s learned weights (there isn’t a human-interpretable “x axis = topic” kind of basis).
+  - Why “angle” works: Similarity is often computed with cosine similarity:
+    cos(x, y) = (x · y) / (||x|| ||y||)
+    This equals the cosine of the angle between the two vectors.
+  - What is the origin point?: In the geometry, every vector is drawn from the origin (0, 0, …, 0) to the point x. The “origin” isn’t a special “empty text” embedding; it’s just the zero vector used by linear algebra to define direction/angle. Many embedding APIs also normalize vectors to length 1, so all texts lie on a unit hypersphere centered at the origin—then “angle” is a clean measure of similarity.
+
+  So: the endpoint is the embedding coordinates for the text, and the origin is simply the mathematical zero vector; the meaningful comparison is between two embeddings (directions), not between an embedding and some physical “origin text.”
+
+
+  - ## Note E: What is "chat completion request" means??
+
+  Looking at the code, openai_complete_if_cache calls:
+
+  response = await openai_async_client.chat.completions.create(
+        model=api_model, messages=messages, **kwargs
+  )
+                                                                                                                                                                      
+  This is calling the OpenAI Chat Completions API (the same API used by ChatGPT).
+                                                                                                                                                                      
+  "Chat completion" means:
+  - You send a conversation with messages (system prompt, user query, etc.)
+  - The LLM "completes" the conversation by generating a response
+  - It's called "chat" because it supports multi-turn conversation history
+                                                                                                                                                                      
+  In LightRAG's case, this function is used for TWO purposes:
+  1. Keyword extraction - sends query, gets back JSON with keywords
+  2. Answer generation - sends query + context, gets back the final answer
+
+
+  - ## Note F:
+
+  08:49:14,213 - INFO - lightrag/wnc/wnc_logging.py +293 - [WNC] function=_get_node_data
+  purpose="[STEP 1] Vector DB query returned entities with cosine similarity scores"
+  outputs={
+  "query_text": "IP address, Device, Router, Network configuration",
+  "num_results": 15,
+  "cosine_threshold": 0.3,
+  "entity_similarities": [
+    {
+      "entity_name": "Client IP 192.168.105.105",
+      "distance": "0.47677678",
+      "note": "distance = cosine similarity between query 'IP address, Device, Router, Network configuration' and entity 'Client IP 192.168.105.105' (higher=more similar)"
+    },
+
+  According to logs it seems like distance is caculated between "Client IP 192.168.105.105" and "IP address, Device, Router, Network configuration".
+
+  But shouldn't it supposed to be caculated between "Client IP 192.168.105.105" and "IP address" and "Client IP 192.168.105.105" and "Device"...etc?
+
+  ### ANS:
+
+  Vector DB similarity is still computed “one-by-one”, but it’s one entity vector vs one query vector.
+
+  In your log the query is:
+
+  "IP address, Device, Router, Network configuration"
+
+  Almost all embedding models turn that entire string into a single embedding vector (it’s not four separate vectors unless you explicitly embed each keyword
+  separately). So the score shown is effectively:
+
+  cos_sim( embed("IP address, Device, Router, Network configuration"), embed("Client IP 192.168.105.105") )
+
+  That’s why it looks like it’s comparing the entity to “all keyword vectors”: the “all keywords” are just part of the single query text that produced the single
+  query embedding.
+
+  - ## Note G: How does _find_related_text_unit_from_entities rank text chunk?
+
+  /srv/ai/LightRAG/wnc_kdb/test_json_260126/sample_001_basic_query.json in below log is in 2nd place (in node_datas ).
+
+  09:19:25,875 - INFO - lightrag/wnc/wnc_logging.py +293 - [WNC] function=_find_related_text_unit_from_entities
+  purpose="Extracts chunk IDs from entities' source_id fields, counts occurrences, selects top chunks via WEIGHT polling or VECTOR similarity, retrieves chunk content from text_chunks_db"
+  inputs={
+  "node_datas": [
+    {
+      "entity_id": "Client IP 192.168.105.105",
+      "entity_type": "data",
+      "description": "The Client IP 192.168.105.105 is noted in a sample case as belonging to a private network within the cybersecurity training scenario.<SEP>The Client IP 192.168.105.105 is noted in the audit as belonging to a known virtual machine used for automated testing.<SEP>The client IP 192.168.105.105 identifies a specific workstation experiencing connectivity issues.<SEP>The Client IP 192.168.105.105 is an address that indicates traffic from a device within the private IPv4 address range.",
+      "source_id": "chunk-c3a25046ff05d09ccd4194290af9d217<SEP>chunk-fa74c8bfd860ce62096f3455f1f0be4c<SEP>chunk-d40860c83241411fa64632b9e75a159f<SEP>chunk-b870b7333b60812289a6d82e07f408a8",
+      "file_path": "/srv/ai/LightRAG/wnc_kdb/test_txt_260126/text_3.txt<SEP>/srv/ai/LightRAG/wnc_kdb/test_txt_260126/text_5.txt<SEP>/srv/ai/LightRAG/wnc_kdb/test_txt_260126/text_2.txt<SEP>/srv/ai/LightRAG/wnc_kdb/test_txt_260126/text_1.txt",
+      "created_at": 1769419139,
+      "created_at (readable)": "2026-01-26 09:18:59 UTC",
+      "truncate": "",
+      "entity_name": "Client IP 192.168.105.105",
+      "rank": 6
+    },
+    {
+      "entity_id": "Device Info",
+      "entity_type": "concept",
+      "description": "Device Info refers to information regarding devices, possibly including configurations or status details.",
+      "source_id": "chunk-3fcb7e6128f2d927891355e4ffb1ebbc",
+      "file_path": "/srv/ai/LightRAG/wnc_kdb/test_json_260126/sample_001_basic_query.json",
+      "created_at": 1769419160,
+      "created_at (readable)": "2026-01-26 09:19:20 UTC",
+      "truncate": "",
+      "entity_name": "Device Info",
+      "rank": 0
+    },
+
+  ### ANS:
+
+  _find_related_text_unit_from_entities() is doing two different “orderings”, and the one you’re looking at in the inputs log isn’t the one that determines the chunk order in the outputs.
+
+
+  - The “2nd file” you’re pointing at is in node_datas (entities list). That list is ordered by entity retrieval (entity-vdb similarity / then KG degree “rank”), not by chunk relevance.
+  - Chunk selection then switches to kg_chunk_pick_method="VECTOR" and calls pick_by_vector_similarity() (lightrag/operate.py in
+    _find_related_text_unit_from_entities, and lightrag/utils.py in pick_by_vector_similarity).
+      - It unions all chunk IDs referenced by all entities into a set() (lightrag/utils.py in pick_by_vector_similarity), so any “entity #2” position is discarded.
+      - It then ranks those candidate chunk IDs by cosine similarity between the query embedding and each chunk embedding, and sorts descending (lightrag/utils.py in pick_by_vector_similarity).
+  - In your run, there are 6 candidate chunk IDs total, and the JSON chunk ends up last because its chunk embedding is least similar to "What is device's IP address?" (it contains 192.168.1.105 and lots of JSON boilerplate, while the 5 txt chunks repeatedly mention 192.168.105.105).
+
+  So: “2nd in node_datas” just means the entity Device Info matched the query; it does not mean its source chunk will rank highly once chunk-level vector similarity is applied.
+
+  - chunk_occurrence_count: doesn’t affect cosine, but it’s used to build each entity’s sorted_chunks (frequency-sorted). Even though VECTOR mode later unions IDs
+    into a set, this still matters for:
+      - Debugging why certain chunk IDs are even in the candidate pool (they came from which entities / how often).
+      - Interpreting fallback behavior (if VECTOR fails and it falls back to WEIGHT, then chunk_occurrence_count does drive selection).
+  - num_of_chunks (computed in _find_related_text_unit_from_entities): doesn’t affect cosine values, but it affects:
+      - How many top-ranked cosine chunks you keep (similarities[:num_of_chunks]), which is exactly your “why did this one end up 6th / dropped” question.
+      - Whether a “low-ranked but still relevant” chunk would have been included if num_of_chunks were higher.
+  - kg_chunk_pick_method: doesn’t affect cosine values, but determines whether cosines are even used:
+      - VECTOR → cosine ranking path.
+      - WEIGHT → no cosine; selection is polling by frequency.
+
+  - ## Note H: What is sorted_chunks in entity?
+
+  In this codepath, sorted_chunks is a list of chunk IDs attached to each entity, ordered by how strongly that chunk is associated with the entity (by frequency).
+
+  Where it comes from:
+
+  - In _find_related_text_unit_from_entities() (lightrag/operate.py), it iterates entities and parses each entity’s source_id field (often a <SEP>-joined string of
+    chunk IDs).
+  - It counts how many times each chunk ID appears across entities into chunk_occurrence_count.
+  - For each entity, it builds:
+      - entity_info["chunks"]: the chunk IDs referenced by that entity.
+      - entity_info["sorted_chunks"]: those same chunk IDs sorted descending by chunk_occurrence_count.get(chunk_id, 0).
+
+  So sorted_chunks is not “sorted by cosine similarity”; it’s “sorted by how frequently the chunk appears as a source across the retrieved entities”. In VECTOR mode,
+  those IDs are later pooled and re-ranked by cosine in pick_by_vector_similarity().
+
+
+  - ## Note I: If we don't set re-rank model, LightRAG will not do re-order?
+
+  Not exactly.
+
+  - No reranker was applied in your run: 03:20:54,105 - WARNING - lightrag/utils.py ... Rerank is enabled but no rerank model is configured ... returning original
+    documents. So there was no re-ranking by a rerank model.
+  - But chunks can still be selected/ordered by retrieval, e.g. kg_chunk_pick_method=VECTOR triggers “vector similarity chunk selection” (03:20:54,097–03:20:54,099),
+    which orders candidates by cosine similarity to the query embedding (that’s a form of ordering even without a rerank model).
+
+  - ## Note J : What does "occurrence" impact on the prompt we send to LLM?
+  
+  For example only 1 file mention Client IP is 192.168.6.105, but there are 5 other files mention client IP is 192.168.6.77.
+
+  ### ANS:
+  In this repo, “occurrence” is not “how many times an IP string appears in the raw text”. It’s how many retrieved KG items (entities/relations) point to the same
+  chunk_id via source_id, and that affects which chunks make it into the Document Chunks section of the prompt (and in what order).
+
+  Where “occurrence” impacts the prompt
+
+  1. Entity→chunk selection (KG context)
+
+  - _find_related_text_unit_from_entities extracts chunk IDs from each entity’s source_id, then counts chunk occurrences across the retrieved entities (lightrag/operate.py:5607).
+  - If KG_CHUNK_PICK_METHOD=WEIGHT, it uses those frequencies to select chunks via weighted polling (lightrag/operate.py:5677).
+  - If KG_CHUNK_PICK_METHOD=VECTOR, it primarily selects by vector similarity; occurrence is still computed, but it’s not the main ranking signal unless it falls back to WEIGHT (lightrag/operate.py:5641).
+
+  2. Relation→chunk selection (KG context)
+
+  - Same idea for relations in _find_related_text_unit_from_relations: occurrence counts can drive selection when using WEIGHT / fallback (lightrag/operate.py:5892).
+
+  3. Dedup + ordering effects
+
+  - During merging, duplicated chunk_ids are removed while preserving the first occurrence order coming from (vector/entity/relation) sources (lightrag/operate.py:4845). So whichever path “surfaces” a chunk earlier tends to be keeped.
+
+  4. Reference list ordering
+
+  - The prompt’s “Reference Document List” IDs are assigned by file_path occurrence frequency among selected chunks (more chunks from a file ⇒ smaller reference_id) (lightrag/utils.py:3845).
+
+  Your example (1 file has 192.168.6.105, 5 files have 192.168.6.77)
+
+  - If those 5 files produce KG entities/relations whose source_id covers multiple chunks, the chunks containing 192.168.6.77 will typically have higher “occurrence”
+    ⇒ more likely to be selected (especially under KG_CHUNK_PICK_METHOD=WEIGHT).
+  - But a single file mentioning 192.168.6.105 can still enter the prompt if it’s linked to a very query-relevant entity (or wins by vector similarity under KG_CHUNK_PICK_METHOD=VECTOR), and once it’s in the prompt the LLM may treat it as “more authoritative” if it’s structured (XML/QA-like) even if it’s outnumbered.
+
+  There are two different “wins” happening:
+
+  1. Selection (who gets into the candidate list)
+
+  - Here, “occurrence” can matter (especially with KG_CHUNK_PICK_METHOD=WEIGHT): chunks that appear in more entities/relations are more likely to be selected.
+
+  2. Deduplication/merge (what happens if the same chunk is selected multiple times via different paths)
+
+  - After selection, the system merges chunks from multiple sources (vector/entity/relation). The same chunk_id can show up more than once.
+  - At that point, duplicates are removed while preserving the first time that chunk_id appears in the merged list (operate.py comment you cited).
+  - That’s why “first surface wins”: once a chunk_id is already included, later repeats of that same chunk_id don’t add weight—they’re simply dropped. The system
+    doesn’t keep a “duplicate count” and then reorder by it; it keeps one copy.

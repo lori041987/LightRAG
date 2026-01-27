@@ -72,7 +72,7 @@ class OpenAITestConfig:
 
     # Query parameters
     # chunk_top_k: Maximum number of text chunks sent to LLM for answer generation
-    chunk_top_k: int = 5
+    chunk_top_k: int = 3
 
     # Vector similarity threshold
     # cosine_threshold: Minimum cosine similarity score for entity/edge retrieval (0.0-1.0)
@@ -98,7 +98,7 @@ class OpenAITestConfig:
     # - "skip": Skip indexing entirely (same as skip_index=True)
     # - "incremental": Only index new files not already in storage (default)
     # - "force": Force re-index all files, clearing existing storage first
-    reindex_strategy: Literal["skip", "incremental", "force"] = "force"
+    reindex_strategy: Literal["skip", "incremental", "force"] = "incremental"
 
     # Logging configuration
     # LightRAG log level: DEBUG, INFO, WARNING, ERROR
