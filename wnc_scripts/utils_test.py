@@ -397,7 +397,7 @@ def load_mixed_docs(
 
 # [WNC] Load documents using textract backend for various file types
 def load_docs_with_textract(
-    kdb_dir: Path, include_ground_truth: bool
+    kdb_dir: Path, include_ground_truth: bool, preprocess_json: bool = False
 ) -> Tuple[List[str], List[str]]:
     """
     Ingest backend: textract

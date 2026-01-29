@@ -24,7 +24,7 @@ class RagAnythingSettings:
 
 @dataclass
 class IngestSettings:
-    backend: Literal["simple", "textract", "raganything"] = "simple"
+    backend: Literal["simple", "textract", "raganything"] = "textract"
     include_ground_truth: bool = True
     # Pre-process JSON files into flattened text format (key: value)
     # If False, index raw JSON as-is
@@ -49,26 +49,28 @@ class OpenAISettings:
     api_version: str | None = None
 
     # Models
-    chat_model: str = "gpt-4o-mini"
-    vision_model: str = "gpt-4o-mini"
+    chat_model: str = "gpt-5.1-chat-latest"  # Changed from gpt-4o-mini for better reliability
+    vision_model: str = "gpt-5.1-chat-latest"
     embed_model: str = "text-embedding-3-small"
     embed_dim: int = 1536
 
 
 @dataclass
 class OpenAITestConfig:
-    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb"
+    #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb"
     #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/3gpp"
-    #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260123"
+    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260126"
+    #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_3gpp"
 
-    #working_dir: str = "/srv/ai/LightRAG/rag_storage/openai_3gpp"
-    working_dir: str = "/srv/ai/LightRAG/rag_storage/wnc_kdb"
+    working_dir: str = "/srv/ai/LightRAG/rag_storage/test_json_260126"
+    #working_dir: str = "/srv/ai/LightRAG/rag_storage/wnc_kdb"
+    #working_dir: str = "/srv/ai/LightRAG/rag_storage/test_3gpp"
 
     mode: Literal["naive", "local", "global", "hybrid", "mix", "bypass"] = "hybrid"
     skip_index: bool = False
 
     #question: str = "What is client's IP address?"
-    question: str = "What is device's IP address?"
+    question: str = "What is Session Management procedures?"
 
     # Query parameters
     # chunk_top_k: Maximum number of text chunks sent to LLM for answer generation
@@ -98,7 +100,7 @@ class OpenAITestConfig:
     # - "skip": Skip indexing entirely (same as skip_index=True)
     # - "incremental": Only index new files not already in storage (default)
     # - "force": Force re-index all files, clearing existing storage first
-    reindex_strategy: Literal["skip", "incremental", "force"] = "incremental"
+    reindex_strategy: Literal["skip", "incremental", "force"] = "force"
 
     # Logging configuration
     # LightRAG log level: DEBUG, INFO, WARNING, ERROR
@@ -107,15 +109,26 @@ class OpenAITestConfig:
     # "trace" will enable freq logs: sanitize_text_for_encoding(), compute_mdhash_id()
     wnc_log_level: Literal["trace", "debug", "info", "warning", "error"] = "info"
     # Enable verbose debug mode (adds extra detailed logging)
-    verbose_debug: bool = True
+    verbose_debug: bool = False
     # WNC log delimiter: separator between log fields
     # - "pipe": use " | " (compact, single line)
     # - "newline": use "\n  " (multi-line, easier to read)
     # - "comma": use ", " (CSV-like)
     wnc_log_delimiter: Literal["pipe", "newline", "comma"] = "newline"
-    # WNC trace log content limit: max chars to show for content in trace logs
-    # Set to 0 for unlimited, or positive int for max length
+    # WNC log length controls (comparison):
+    # - `wnc_log_trace_content_limit`: caps verbose TRACE-level logs only.
+    #   Use this to reduce the noise from very chatty trace instrumentation.
+    # - `wnc_log_content_limit`: would cap inputs/outputs for ALL
+    #   WNC log levels (INFO/DEBUG/WARNING/ERROR/TRACE). Use that when INFO logs
+    #   are still too large because they include big fields like `content`.
+    #
+    # WNC trace log content limit: max chars to show for content in TRACE logs.
+    # Set to 0 for unlimited, or positive int for max length.
     wnc_log_trace_content_limit: int = 10000
+    # WNC log content limit: max chars for large string fields in ALL logs (inputs/outputs/note/side_effects)
+    # Set to 0 for unlimited, or positive int for max length
+    # Truncates string values inside inputs/outputs dicts before JSON serialization to keep JSON valid
+    wnc_log_content_limit: int = 0  # 0 = unlimited
 
     # Cache configuration
     # Enable LLM response caching to avoid redundant API calls

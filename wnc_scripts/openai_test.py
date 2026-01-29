@@ -198,13 +198,17 @@ def main() -> None:
         lightrag.utils.VERBOSE_DEBUG = True
 
     # [WNC] Set WNC log delimiter from config
-    from lightrag.wnc import set_delimiter, set_trace_content_limit
+    from lightrag.wnc import set_delimiter, set_trace_content_limit, set_log_content_limit
     wnc_delimiter = getattr(config, "wnc_log_delimiter", "pipe")
     set_delimiter(wnc_delimiter)
 
     # [WNC] Set trace content limit from config
     wnc_trace_limit = getattr(config, "wnc_log_trace_content_limit", 10000)
     set_trace_content_limit(wnc_trace_limit)
+
+    # [WNC] Set log content limit from config
+    wnc_content_limit = getattr(config, "wnc_log_content_limit", 0)
+    set_log_content_limit(wnc_content_limit)
 
     # [WNC] Use time_only=True to show only time (09:20:06,054) instead of full datetime
     enable_console_timestamps("lightrag", time_only=True)
@@ -270,6 +274,7 @@ def main() -> None:
                 docs, file_paths = load_docs_with_textract(
                     kdb_dir=kdb_dir,
                     include_ground_truth=config.ingest.include_ground_truth,
+                    preprocess_json=config.ingest.preprocess_json,
                 )
                 if not docs:
                     raise SystemExit(

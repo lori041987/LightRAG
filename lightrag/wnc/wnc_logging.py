@@ -27,6 +27,9 @@ _DELIMITER = " | "
 # Global trace content limit (can be changed via set_trace_content_limit())
 _TRACE_CONTENT_LIMIT = 10000  # 0 = unlimited
 
+# Global log content limit for large string fields (can be changed via set_log_content_limit())
+_LOG_CONTENT_LIMIT = 0  # 0 = unlimited
+
 # JSON formatting settings for inputs/outputs
 JSON_ENSURE_ASCII = False
 JSON_INDENT = 2
@@ -75,6 +78,26 @@ def get_trace_content_limit() -> int:
     return _TRACE_CONTENT_LIMIT
 
 
+def set_log_content_limit(limit: int) -> None:
+    """
+    Set the global content limit for all WNC logs.
+
+    Truncates large string fields (inputs/outputs dicts, note, side_effects)
+    before JSON serialization to keep JSON valid while limiting log size.
+
+    Args:
+        limit: Maximum characters for string values in logs.
+               0 = unlimited, positive int = max length
+    """
+    global _LOG_CONTENT_LIMIT
+    _LOG_CONTENT_LIMIT = limit
+
+
+def get_log_content_limit() -> int:
+    """Get the current log content limit."""
+    return _LOG_CONTENT_LIMIT
+
+
 def _is_timestamp_field(key: str, value: Any) -> bool:
     """
     Detect if a key-value pair represents a Unix timestamp.
@@ -116,6 +139,39 @@ def _convert_timestamp_to_readable(timestamp: int) -> str:
     except (ValueError, OSError):
         # Handle invalid timestamps
         return f"<invalid timestamp: {timestamp}>"
+
+
+def _truncate_strings(obj: Any, limit: int) -> Any:
+    """
+    Recursively truncate long strings in nested data structures.
+
+    Args:
+        obj: Object to process (dict, list, str, or other types)
+        limit: Maximum string length (0 = unlimited)
+
+    Returns:
+        Copy of obj with strings truncated
+    """
+    if limit <= 0:
+        # No truncation needed
+        return obj
+
+    # Handle strings
+    if isinstance(obj, str):
+        if len(obj) > limit:
+            return f"{obj[:limit]}...(truncated, orig={len(obj)})"
+        return obj
+
+    # Handle lists
+    if isinstance(obj, list):
+        return [_truncate_strings(item, limit) for item in obj]
+
+    # Handle dictionaries
+    if isinstance(obj, dict):
+        return {key: _truncate_strings(value, limit) for key, value in obj.items()}
+
+    # For other types (int, float, bool, None, etc.), return as-is
+    return obj
 
 
 def _make_json_serializable(obj: Any) -> Any:
@@ -249,6 +305,9 @@ def wnc_log(
     # Determine if this is trace level for content formatting
     is_trace = _is_trace if _is_trace is not None else (level == "trace")
 
+    # Get log content limit for truncation
+    content_limit = get_log_content_limit()
+
     # Auto-format inputs if it's a dict
     formatted_inputs = inputs
     if isinstance(inputs, dict):
@@ -257,10 +316,16 @@ def wnc_log(
             serializable_inputs = _make_json_serializable(inputs)
         else:
             serializable_inputs = inputs
+        # Truncate strings before JSON serialization to keep JSON valid
+        serializable_inputs = _truncate_strings(serializable_inputs, content_limit)
         formatted_inputs = json.dumps(serializable_inputs, ensure_ascii=JSON_ENSURE_ASCII, indent=JSON_INDENT)
         # Unescape common escape sequences for better readability in logs
         if JSON_UNESCAPE_FOR_READABILITY:
             formatted_inputs = formatted_inputs.replace('\\n', '\n').replace('\\"', '"')
+    elif isinstance(inputs, str) and content_limit > 0:
+        # Truncate plain string inputs
+        if len(inputs) > content_limit:
+            formatted_inputs = f"{inputs[:content_limit]}...(truncated, orig={len(inputs)})"
 
     # Auto-format outputs if it's a dict
     formatted_outputs = outputs
@@ -270,18 +335,33 @@ def wnc_log(
             serializable_outputs = _make_json_serializable(outputs)
         else:
             serializable_outputs = outputs
+        # Truncate strings before JSON serialization to keep JSON valid
+        serializable_outputs = _truncate_strings(serializable_outputs, content_limit)
         formatted_outputs = json.dumps(serializable_outputs, ensure_ascii=JSON_ENSURE_ASCII, indent=JSON_INDENT)
         # Unescape common escape sequences for better readability in logs
         if JSON_UNESCAPE_FOR_READABILITY:
             formatted_outputs = formatted_outputs.replace('\\n', '\n').replace('\\"', '"')
+    elif isinstance(outputs, str) and content_limit > 0:
+        # Truncate plain string outputs
+        if len(outputs) > content_limit:
+            formatted_outputs = f"{outputs[:content_limit]}...(truncated, orig={len(outputs)})"
+
+    # Truncate note and side_effects if they're strings
+    truncated_note = note
+    if note and content_limit > 0 and len(note) > content_limit:
+        truncated_note = f"{note[:content_limit]}...(truncated, orig={len(note)})"
+
+    truncated_side_effects = side_effects
+    if side_effects and content_limit > 0 and len(side_effects) > content_limit:
+        truncated_side_effects = f"{side_effects[:content_limit]}...(truncated, orig={len(side_effects)})"
 
     message = format_wnc_log(
         function_name=function_name,
         purpose=purpose,
         inputs=formatted_inputs,
         outputs=formatted_outputs,
-        side_effects=side_effects,
-        note=note,
+        side_effects=truncated_side_effects,
+        note=truncated_note,
         is_trace=is_trace,
     )
 
