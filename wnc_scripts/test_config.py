@@ -1,5 +1,5 @@
 """
-Configuration for `wnc_scripts/openai_test.py`.
+Configuration for LightRAG test scripts (openai_test.py, ollama_test.py, etc.).
 
 Edit this file to change defaults instead of relying on CLI flags.
 """
@@ -49,10 +49,29 @@ class OpenAISettings:
     api_version: str | None = None
 
     # Models
-    chat_model: str = "gpt-5.1-chat-latest"  # Changed from gpt-4o-mini for better reliability
+    chat_model: str = "gpt-5.1-chat-latest"  # Changed from gpt-4o-mini for better reliability (but lower TPM limit)
     vision_model: str = "gpt-5.1-chat-latest"
     embed_model: str = "text-embedding-3-small"
     embed_dim: int = 1536
+
+
+@dataclass
+class OllamaSettings:
+    # Ollama host (None = use default localhost:11434)
+    host: str | None = None
+    timeout: int | None = None
+    api_key_env: str | None = None  # Optional: set to env var name if using auth
+
+    # Models (must be pulled via `ollama pull` first)
+    chat_model: str = "qwen3:8b"
+    embed_model: str = "bge-m3:567m"
+    embed_dim: int = 1024  # bge-m3 embedding dimension
+
+    # Think mode for models that support it (qwen3, gpt-oss, deepseek-v3, deepseek-r1)
+    # False = disable chain-of-thought reasoning (much faster)
+    # True = enable chain-of-thought reasoning (slower but more detailed)
+    # None = don't set (use model default)
+    think: bool | None = False
 
 
 @dataclass
@@ -66,11 +85,19 @@ class OpenAITestConfig:
     #working_dir: str = "/srv/ai/LightRAG/rag_storage/wnc_kdb"
     #working_dir: str = "/srv/ai/LightRAG/rag_storage/test_3gpp"
 
+    # Query mode - controls retrieval strategy
+    # Options: naive, local, global, hybrid, mix, bypass
+    # For detailed explanation with examples, see: wnc_docs/query_modes_explanation.md
+    # Quick summary:
+    #   - hybrid (recommended): combines entities + relationships for comprehensive results
+    #   - local: entity-focused, best for "What is X?" questions
+    #   - global: relationship-focused, best for "How are things connected?"
+    #   - naive: simple vector search only (fastest)
     mode: Literal["naive", "local", "global", "hybrid", "mix", "bypass"] = "hybrid"
     skip_index: bool = False
 
-    #question: str = "What is client's IP address?"
-    question: str = "What is Session Management procedures?"
+    question: str = "What is client's IP address?"
+    #question: str = "What is Session Management procedures?"
 
     # Query parameters
     # chunk_top_k: Maximum number of text chunks sent to LLM for answer generation
@@ -109,7 +136,7 @@ class OpenAITestConfig:
     # "trace" will enable freq logs: sanitize_text_for_encoding(), compute_mdhash_id()
     wnc_log_level: Literal["trace", "debug", "info", "warning", "error"] = "info"
     # Enable verbose debug mode (adds extra detailed logging)
-    verbose_debug: bool = False
+    verbose_debug: bool = True
     # WNC log delimiter: separator between log fields
     # - "pipe": use " | " (compact, single line)
     # - "newline": use "\n  " (multi-line, easier to read)
@@ -128,7 +155,7 @@ class OpenAITestConfig:
     # WNC log content limit: max chars for large string fields in ALL logs (inputs/outputs/note/side_effects)
     # Set to 0 for unlimited, or positive int for max length
     # Truncates string values inside inputs/outputs dicts before JSON serialization to keep JSON valid
-    wnc_log_content_limit: int = 0  # 0 = unlimited
+    wnc_log_content_limit: int = 1000  # 0 = unlimited
 
     # Cache configuration
     # Enable LLM response caching to avoid redundant API calls
@@ -138,9 +165,10 @@ class OpenAITestConfig:
 
     ingest: IngestSettings = IngestSettings()
     openai: OpenAISettings = OpenAISettings()
+    ollama: OllamaSettings = OllamaSettings()
 
 
-# Default config used by `wnc_scripts/openai_test.py` unless `--config` points elsewhere.
+# Default config used by test scripts (openai_test.py, ollama_test.py) unless `--config` points elsewhere.
 #
 # You can either change the defaults above, or mutate the instance here, e.g.:
 #   CONFIG.ingest.backend = "raganything"

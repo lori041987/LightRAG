@@ -10,11 +10,11 @@ What this script does
 
 Configuration
 -------------
-Most settings are loaded from `wnc_scripts/openai_test_config.py` (or `--config <path>`).
+Most settings are loaded from `wnc_scripts/test_config.py` (or `--config <path>`).
 
 Key flags
 ---------
-- `skip_index` can be set in `wnc_scripts/openai_test_config.py` to run new questions
+- `skip_index` can be set in `wnc_scripts/test_config.py` to run new questions
   WITHOUT re-indexing (fast). This assumes `working_dir` already contains previously indexed data.
 
 Storage output (default backends)
@@ -63,32 +63,14 @@ from utils_test import (
     load_mixed_docs,
     load_docs_with_textract,
     write_index_input_manifest,
+    load_test_config,
+    initialize_rag_storages,
+    finalize_rag_storages,
+    index_documents,
+    run_query,
 )
 
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("openai_test_config.py")
-
-
-def _load_config_module(config_path: Path) -> ModuleType:
-    module_name = f"openai_test_config_{abs(hash(str(config_path.resolve())))}"
-    spec = importlib.util.spec_from_file_location(module_name, config_path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"Unable to load config module: {config_path}")
-    module = importlib.util.module_from_spec(spec)
-    # dataclasses (and other reflection) expect the module to exist in sys.modules.
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_openai_test_config(config_path: Path):
-    if not config_path.exists():
-        raise SystemExit(f"Config file not found: {config_path}")
-
-    module = _load_config_module(config_path)
-    config = getattr(module, "CONFIG", None)
-    if config is None:
-        raise SystemExit(f"Config file must define `CONFIG`: {config_path}")
-    return config
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("test_config.py")
 
 
 
@@ -97,7 +79,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
-        help="Path to config file (default: wnc_scripts/openai_test_config.py).",
+        help="Path to config file (default: wnc_scripts/test_config.py).",
     )
     parser.add_argument("--kdb-dir", default=None, help="Override kdb_dir from config.")
     parser.add_argument(
@@ -151,7 +133,7 @@ def main() -> None:
 
     # Important argparse behavior:
     # option names like `--skip-index` become attributes like `args.skip_index` (dashes -> underscores).
-    config = _load_openai_test_config(Path(args.config))
+    config = load_test_config(Path(args.config))
     kdb_dir = Path(args.kdb_dir) if args.kdb_dir else Path(config.kdb_dir)
     working_dir = str(args.working_dir) if args.working_dir else str(config.working_dir)
     mode = str(args.mode) if args.mode else str(config.mode)
@@ -394,8 +376,7 @@ def main() -> None:
     # LightRAG requires explicit storage lifecycle management.
     # We initialize storages before indexing/querying and finalize at the end.
     loop = always_get_an_event_loop()
-    with phase("Initialize storages"):
-        loop.run_until_complete(rag.initialize_storages())
+    initialize_rag_storages(rag)
     try:
         def _make_raganything(vision_model_func):
             try:
@@ -442,16 +423,12 @@ def main() -> None:
                 # chunking -> embeddings -> entity/relation extraction -> graph construction.
                 ingest_backend = config.ingest.backend
                 if ingest_backend in {"simple", "textract"}:
-                    logger.info(
-                        "Indexing %s documents into %s (max_parallel_insert=%s)",
-                        len(docs),
-                        working_dir,
-                        int(getattr(config, "max_parallel_insert", 2)),
+                    index_documents(
+                        rag,
+                        docs,
+                        file_paths,
+                        max_parallel_insert=int(getattr(config, "max_parallel_insert", 2)),
                     )
-                    doc_ids = [compute_mdhash_id(d, prefix="doc-") for d in docs]
-                    for doc_id, path in zip(doc_ids, file_paths):
-                        logger.info("Index input: doc_id=%s file=%s", doc_id, path)
-                    rag.insert(docs, file_paths=file_paths, ids=doc_ids)
                 elif ingest_backend == "raganything":
                     try:
                         from raganything import RAGAnything  # type: ignore
@@ -603,18 +580,12 @@ def main() -> None:
                     rag_multi.query_with_multimodal(question, mode=mode)
                 )
         else:
-            with phase("Query"):
-                logger.info("Question:\n%s", question.strip())
-                query_param = QueryParam(mode=mode)
-                if chunk_top_k is not None:
-                    query_param.chunk_top_k = int(chunk_top_k)
-                answer = rag.query(question, param=query_param)
+            answer = run_query(rag, question, mode=mode, chunk_top_k=chunk_top_k)
 
         logger.info("Question:\n%s", question.strip())
         logger.info("Answer:\n%s", answer)
     finally:
-        with phase("Finalize storages"):
-            loop.run_until_complete(rag.finalize_storages())
+        finalize_rag_storages(rag)
 
 
 if __name__ == "__main__":

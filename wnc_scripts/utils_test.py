@@ -7,6 +7,8 @@ This module provides reusable utilities for testing LightRAG with different LLM 
 - Document loading and formatting (JSON, text, PDF)
 - Phase timing context manager
 - Index input manifest generation
+- Configuration loading
+- LightRAG initialization and indexing logic
 
 Usage:
     from wnc_scripts.utils_test import (
@@ -16,18 +18,31 @@ Usage:
         phase,
         load_mixed_docs,
         write_index_input_manifest,
+        load_config_module,
+        initialize_rag_storages,
+        index_documents,
+        run_query,
     )
 """
 
+import importlib.util
 import json
 import logging
+import os
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
-from typing import Tuple, List
+from types import ModuleType
+from typing import Tuple, List, Any, Callable
 
-from lightrag.utils import logger
+from lightrag import LightRAG, QueryParam
+from lightrag.utils import (
+    always_get_an_event_loop,
+    compute_mdhash_id,
+    logger,
+)
 
 
 # [WNC] Custom formatter to include file path and line number in logs
@@ -472,3 +487,143 @@ def write_index_input_manifest(
             f.write(f"[{idx}] doc_chars: {len(doc)}\n")
             f.write(f"[{idx}] doc_preview: {preview}\n")
             f.write("\n")
+
+
+# [WNC] Configuration loading helpers
+def load_config_module(config_path: Path) -> ModuleType:
+    """
+    Load a Python module from a file path as a configuration module.
+
+    Args:
+        config_path: Path to the config file (e.g., test_config.py)
+
+    Returns:
+        Loaded module object
+    """
+    module_name = f"test_config_{abs(hash(str(config_path.resolve())))}"
+    spec = importlib.util.spec_from_file_location(module_name, config_path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Unable to load config module: {config_path}")
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses (and other reflection) expect the module to exist in sys.modules.
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_test_config(config_path: Path) -> Any:
+    """
+    Load test configuration from a Python file.
+
+    Args:
+        config_path: Path to the config file (must define CONFIG variable)
+
+    Returns:
+        The CONFIG object from the module
+    """
+    if not config_path.exists():
+        raise SystemExit(f"Config file not found: {config_path}")
+
+    module = load_config_module(config_path)
+    config = getattr(module, "CONFIG", None)
+    if config is None:
+        raise SystemExit(f"Config file must define `CONFIG`: {config_path}")
+    return config
+
+
+# [WNC] LightRAG initialization and operation helpers
+def initialize_rag_storages(rag: LightRAG) -> None:
+    """
+    Initialize LightRAG storages (must be called before indexing/querying).
+
+    Args:
+        rag: LightRAG instance
+    """
+    loop = always_get_an_event_loop()
+    with phase("Initialize storages"):
+        loop.run_until_complete(rag.initialize_storages())
+
+
+def finalize_rag_storages(rag: LightRAG) -> None:
+    """
+    Finalize LightRAG storages (must be called at the end).
+
+    Args:
+        rag: LightRAG instance
+    """
+    loop = always_get_an_event_loop()
+    with phase("Finalize storages"):
+        loop.run_until_complete(rag.finalize_storages())
+
+
+def index_documents(
+    rag: LightRAG,
+    docs: List[str],
+    file_paths: List[str],
+    max_parallel_insert: int = 2,
+) -> None:
+    """
+    Index documents into LightRAG using simple/textract backend.
+
+    Args:
+        rag: LightRAG instance (storages must be initialized)
+        docs: List of document texts
+        file_paths: List of source file paths (same length as docs)
+        max_parallel_insert: Concurrent document processing limit
+    """
+    with phase("Index documents"):
+        logger.info(
+            "Indexing %s documents (max_parallel_insert=%s)",
+            len(docs),
+            max_parallel_insert,
+        )
+        doc_ids = [compute_mdhash_id(d, prefix="doc-") for d in docs]
+        for doc_id, path in zip(doc_ids, file_paths):
+            logger.info("Index input: doc_id=%s file=%s", doc_id, path)
+        rag.insert(docs, file_paths=file_paths, ids=doc_ids)
+
+
+def run_query(
+    rag: LightRAG,
+    question: str,
+    mode: str = "hybrid",
+    chunk_top_k: int | None = None,
+) -> str:
+    """
+    Run a query against LightRAG (text-only, no multimodal).
+
+    Args:
+        rag: LightRAG instance (storages must be initialized)
+        question: Query text
+        mode: Query mode (naive|local|global|hybrid|mix|bypass)
+        chunk_top_k: Maximum number of chunks to return (optional)
+
+    Returns:
+        Answer text
+    """
+    loop = always_get_an_event_loop()
+    with phase("Query"):
+        logger.info("Question:\n%s", question.strip())
+        query_param = QueryParam(mode=mode)
+        if chunk_top_k is not None:
+            query_param.chunk_top_k = int(chunk_top_k)
+        answer = rag.query(question, param=query_param)
+    return answer
+
+
+def enforce_text_only_mode(config: Any) -> None:
+    """
+    Enforce text-only mode by disabling multimodal features in config.
+
+    This function modifies the config object in-place to ensure:
+    - use_multimodal_query is set to False
+    - RAG-Anything multimodal features are disabled
+
+    Args:
+        config: Configuration object with ingest settings
+    """
+    # Disable multimodal query for RAG-Anything if configured
+    if hasattr(config, "ingest") and hasattr(config.ingest, "raganything"):
+        if hasattr(config.ingest.raganything, "use_multimodal_query"):
+            config.ingest.raganything.use_multimodal_query = False
+            logger.info("Enforced use_multimodal_query=False for text-only mode")
