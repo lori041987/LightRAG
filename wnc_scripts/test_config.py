@@ -52,7 +52,14 @@ class OpenAISettings:
     chat_model: str = "gpt-5.1-chat-latest"  # Changed from gpt-4o-mini for better reliability (but lower TPM limit)
     vision_model: str = "gpt-5.1-chat-latest"
     embed_model: str = "text-embedding-3-small"
-    embed_dim: int = 1536
+    # embed_dim: Embedding dimension - MUST match the model's actual output dimension
+    # This tells LightRAG what vector size to expect from the embedding model
+    # IMPORTANT: This is NOT a parameter sent to the model - it's a declaration of what the model outputs
+    # Common dimensions (native/default):
+    #   - text-embedding-3-small: 1536 (OpenAI supports API reduction, LightRAG passes it)
+    #   - text-embedding-3-large: 3072 (OpenAI supports API reduction, LightRAG passes it)
+    # Setting the wrong dimension will cause mismatch errors!
+    embed_dim: int = 1536  # Correct dimension for text-embedding-3-small (native output)
 
 
 @dataclass
@@ -65,7 +72,11 @@ class OllamaSettings:
     # Models (must be pulled via `ollama pull` first)
     chat_model: str = "qwen3:8b"
     embed_model: str = "bge-m3:567m"
-    embed_dim: int = 1024  # bge-m3 embedding dimension
+    # embed_dim: MUST match the model's actual output dimension (see OpenAISettings for detailed explanation)
+    # bge-m3 native output: 1024 dimensions (fixed)
+    # Note: Ollama API supports dimension reduction via 'dimensions' parameter,
+    # but LightRAG does NOT currently pass this parameter to Ollama embeddings
+    embed_dim: int = 1024  # Correct dimension for bge-m3:567m (native output)
 
     # Think mode for models that support it (qwen3, gpt-oss, deepseek-v3, deepseek-r1)
     # False = disable chain-of-thought reasoning (much faster)
@@ -155,7 +166,7 @@ class OpenAITestConfig:
     # WNC log content limit: max chars for large string fields in ALL logs (inputs/outputs/note/side_effects)
     # Set to 0 for unlimited, or positive int for max length
     # Truncates string values inside inputs/outputs dicts before JSON serialization to keep JSON valid
-    wnc_log_content_limit: int = 1000  # 0 = unlimited
+    wnc_log_content_limit: int = 0  # 0 = unlimited
 
     # Cache configuration
     # Enable LLM response caching to avoid redundant API calls

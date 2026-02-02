@@ -819,7 +819,7 @@ async def openai_embed(
         purpose="Generate embeddings for texts using OpenAI embeddings API",
         inputs={
             "texts_count": len(texts),
-            "texts": texts,
+            "texts": texts,  # These are the actual texts to embed (chunks/entities/relations), NOT prompts
             "model": model,
             "use_azure": use_azure,
             "azure_deployment": azure_deployment,
@@ -827,9 +827,19 @@ async def openai_embed(
             "max_token_size": max_token_size,
         },
         side_effects="Network call to OpenAI/Azure embeddings API; optional text truncation if max_token_size set",
-        note="Used by vector DB operations for entity/relation/chunk embeddings. Returns np.ndarray of shape (len(texts), embedding_dim).",
+        note="Embedding models convert text to vectors WITHOUT prompts/instructions. Just sends raw text to model. "
+             "Used by vector DB operations for entity/relation/chunk embeddings. Returns np.ndarray of shape (len(texts), embedding_dim).",
         level="info",
     )
+
+    # [WNC] Add debug logging to match LLM implementation
+    logger.debug("===== Entering func of Embedding =====")
+    logger.debug(f"Model: {model}   Base URL: {base_url}")
+    logger.debug(f"Use Azure: {use_azure}   Azure Deployment: {azure_deployment}")
+    logger.debug(f"Embedding dim: {embedding_dim}   Max token size: {max_token_size}")
+    logger.debug(f"Num of texts: {len(texts)}")
+    verbose_debug(f"Texts to embed: {texts}")
+    logger.debug("===== Sending Texts to Embedding Model =====")
 
     # Apply text truncation if max_token_size is provided
     if max_token_size is not None and max_token_size > 0:
@@ -888,6 +898,21 @@ async def openai_embed(
 
         # Make API call
         response = await openai_async_client.embeddings.create(**api_params)
+
+        # [WNC] Add debug logging after receiving response to match LLM implementation
+        embeddings_result = np.array(
+            [
+                np.array(dp.embedding, dtype=np.float32)
+                if isinstance(dp.embedding, list)
+                else np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
+                for dp in response.data
+            ]
+        )
+        logger.debug(f"Received embeddings for {len(response.data)} texts")
+        logger.debug(f"Embeddings shape: {embeddings_result.shape}")
+        if hasattr(response, "usage"):
+            logger.debug(f"Prompt tokens: {getattr(response.usage, 'prompt_tokens', 0)}, Total tokens: {getattr(response.usage, 'total_tokens', 0)}")
+        verbose_debug(f"Response: {response}")
 
         if token_tracker and hasattr(response, "usage"):
             token_counts = {

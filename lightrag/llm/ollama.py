@@ -28,11 +28,56 @@ from typing import Optional, Union
 from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     logger,
+    verbose_debug,
 )
+from lightrag.wnc.wnc_logging import wnc_log
 
 
 _OLLAMA_CLOUD_HOST = "https://ollama.com"
 _CLOUD_MODEL_SUFFIX_PATTERN = re.compile(r"(?:-cloud|:cloud)$")
+
+
+def _format_ollama_durations(response: dict) -> str:
+    """
+    [WNC] Format Ollama response duration metrics into human-readable seconds.
+
+    For detailed explanation of these metrics, see: wnc_docs/ollama_response_metrics.md
+
+    Args:
+        response: Response dict from Ollama SDK containing duration fields (in nanoseconds)
+
+    Returns:
+        Formatted string with durations in seconds
+    """
+    def ns_to_s(ns):
+        """Convert nanoseconds to seconds"""
+        return f"{ns / 1_000_000_000:.2f}s" if ns else "N/A"
+
+    total = response.get("total_duration")
+    load = response.get("load_duration")
+    prompt_eval = response.get("prompt_eval_duration")
+    eval_dur = response.get("eval_duration")
+    prompt_count = response.get("prompt_eval_count", "N/A")
+    eval_count = response.get("eval_count", "N/A")
+
+    parts = []
+    if total:
+        parts.append(f"total={ns_to_s(total)}")
+    if load or prompt_eval or eval_dur:
+        breakdown = []
+        if load:
+            breakdown.append(f"load={ns_to_s(load)}")
+        if prompt_eval:
+            breakdown.append(f"prompt_eval={ns_to_s(prompt_eval)}")
+        if eval_dur:
+            breakdown.append(f"eval={ns_to_s(eval_dur)}")
+        if breakdown:
+            parts.append(f"({' + '.join(breakdown)})")
+
+    timing = " ".join(parts) if parts else "N/A"
+    tokens = f"tokens: prompt={prompt_count}, output={eval_count}"
+
+    return f"{timing} | {tokens}"
 
 
 def _coerce_host_for_cloud_model(host: Optional[str], model: object) -> Optional[str]:
@@ -99,6 +144,15 @@ async def _ollama_model_if_cache(
         messages.extend(history_messages)
         messages.append({"role": "user", "content": prompt})
 
+        # [WNC] Add debug logging to match OpenAI implementation
+        logger.debug("===== Entering func of LLM =====")
+        logger.debug(f"Model: {model}   Host: {host}")
+        logger.debug(f"Additional kwargs: {kwargs}")
+        logger.debug(f"Num of history messages: {len(history_messages)}")
+        verbose_debug(f"System prompt: {system_prompt}")
+        verbose_debug(f"Query: {prompt}")
+        logger.debug("===== Sending Query to LLM =====")
+
         response = await ollama_client.chat(model=model, messages=messages, **kwargs)
         if stream:
             """cannot cache stream response and process reasoning"""
@@ -126,6 +180,11 @@ async def _ollama_model_if_cache(
             this information is not needed for the final
             response and can simply be trimmed.
             """
+
+            # [WNC] Add response logging to match OpenAI implementation
+            logger.debug(f"Response content len: {len(model_response)}")
+            logger.debug(f"Performance: {_format_ollama_durations(response)}")
+            verbose_debug(f"Response: {response}")
 
             return model_response
     except Exception as e:
@@ -200,9 +259,34 @@ async def ollama_embed(
         - Ollama API automatically truncates texts exceeding the model's context length
         - The max_token_size parameter is received but not used for client-side truncation
     """
+    # [WNC] Initial log
+    wnc_log(
+        purpose="Generate embeddings for texts using Ollama embeddings API",
+        inputs={
+            "texts_count": len(texts),
+            "texts": texts,  # These are the actual texts to embed (chunks/entities/relations), NOT prompts
+            "embed_model": embed_model,
+            "max_token_size": max_token_size,
+        },
+        side_effects="Network call to Ollama embeddings API; Ollama automatically handles text truncation based on model's num_ctx",
+        note="Embedding models convert text to vectors WITHOUT prompts/instructions. Just sends raw text to model. "
+             "Used by vector DB operations for entity/relation/chunk embeddings. Returns np.ndarray of shape (len(texts), embedding_dim).",
+        level="info",
+    )
+
     # Note: max_token_size is received but not used for client-side truncation.
     # Ollama API handles truncation automatically based on the model's num_ctx setting.
     _ = max_token_size  # Acknowledge parameter to avoid unused variable warning
+
+    # [WNC] Add debug logging to match LLM implementation
+    host = kwargs.get("host", None)
+    logger.debug("===== Entering func of Embedding =====")
+    logger.debug(f"Model: {embed_model}   Host: {host}")
+    logger.debug(f"Max token size: {max_token_size} (not used, Ollama handles truncation)")
+    logger.debug(f"Num of texts: {len(texts)}")
+    verbose_debug(f"Texts to embed: {texts}")
+    logger.debug("===== Sending Texts to Embedding Model =====")
+
     api_key = kwargs.pop("api_key", None)
     if not api_key:
         api_key = os.getenv("OLLAMA_API_KEY")
@@ -224,6 +308,23 @@ async def ollama_embed(
         data = await ollama_client.embed(
             model=embed_model, input=texts, options=options
         )
+
+        # [WNC] Add debug logging after receiving response to match LLM implementation
+        logger.debug(f"Received embeddings for {len(data['embeddings'])} texts")
+        logger.debug(f"Embeddings shape: {np.array(data['embeddings']).shape}")
+        verbose_debug(f"Response: {data}")
+
+        # [WNC] Output log
+        wnc_log(
+            purpose="[OUTPUT] ollama_embed - embeddings generated successfully",
+            outputs={
+                "embeddings": np.array(data["embeddings"]),
+                "embeddings_shape": np.array(data["embeddings"]).shape,
+                "note": "Successfully generated embeddings from Ollama API",
+            },
+            level="info",
+        )
+
         return np.array(data["embeddings"])
     except Exception as e:
         logger.error(f"Error in ollama_embed: {str(e)}")
