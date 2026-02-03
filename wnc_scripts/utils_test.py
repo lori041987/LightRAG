@@ -588,6 +588,8 @@ def run_query(
     question: str,
     mode: str = "hybrid",
     chunk_top_k: int | None = None,
+    enable_rerank: bool | None = None,
+    rerank_top_n: int | None = None,
 ) -> str:
     """
     Run a query against LightRAG (text-only, no multimodal).
@@ -597,6 +599,8 @@ def run_query(
         question: Query text
         mode: Query mode (naive|local|global|hybrid|mix|bypass)
         chunk_top_k: Maximum number of chunks to return (optional)
+        enable_rerank: Enable reranking (optional, uses QueryParam default if None)
+        rerank_top_n: Maximum chunks after reranking (optional)
 
     Returns:
         Answer text
@@ -607,6 +611,10 @@ def run_query(
         query_param = QueryParam(mode=mode)
         if chunk_top_k is not None:
             query_param.chunk_top_k = int(chunk_top_k)
+        if enable_rerank is not None:
+            query_param.enable_rerank = enable_rerank
+        if rerank_top_n is not None:
+            query_param.rerank_top_n = rerank_top_n
         answer = rag.query(question, param=query_param)
     return answer
 
@@ -627,3 +635,105 @@ def enforce_text_only_mode(config: Any) -> None:
         if hasattr(config.ingest.raganything, "use_multimodal_query"):
             config.ingest.raganything.use_multimodal_query = False
             logger.info("Enforced use_multimodal_query=False for text-only mode")
+
+
+# ========== In-process Reranker (Sentence-Transformers CrossEncoder) ==========
+
+# Lazy-loaded singleton CrossEncoder for reranking
+_reranker: "CrossEncoder | None" = None  # type: ignore
+
+
+def get_reranker(model_path: str) -> "CrossEncoder":  # type: ignore
+    """
+    Lazy-load and return the CrossEncoder reranker singleton.
+
+    Args:
+        model_path: Path to local model or HuggingFace model name
+
+    Returns:
+        CrossEncoder instance for reranking
+    """
+    global _reranker
+
+    if _reranker is None:
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is required for reranking. "
+                "Install it with: pip install sentence-transformers"
+            )
+
+        logger.info("Loading reranker model from: %s", model_path)
+        start = perf_counter()
+
+        # Load on CPU to avoid GPU memory issues with embeddings
+        _reranker = CrossEncoder(model_path, device="cpu")
+
+        elapsed = perf_counter() - start
+        logger.info("Reranker model loaded in %.2fs", elapsed)
+
+    return _reranker
+
+
+async def rerank_model_func(
+    query: str,
+    documents: list[str],
+    top_n: int | None = None,
+    extra_body: dict | None = None,
+) -> list[dict]:
+    """
+    In-process reranker using sentence-transformers CrossEncoder.
+
+    Args:
+        query: Search query
+        documents: List of document texts to rerank
+        top_n: Maximum number of results to return (None = return all)
+        extra_body: Extra parameters (unused, for API compatibility)
+
+    Returns:
+        List of dicts with format: [{"index": idx, "relevance_score": score}, ...]
+        Sorted by relevance_score descending
+    """
+    if not documents:
+        logger.warning("rerank_model_func: No documents to rerank")
+        return []
+
+    # Get reranker from config (passed via closure in main())
+    # This will be set when creating the partial function
+    model_path = getattr(rerank_model_func, "_model_path", None)
+    if not model_path:
+        raise ValueError("Reranker model_path not configured")
+
+    reranker = get_reranker(model_path)
+
+    # Create query-document pairs
+    pairs = [(query, doc) for doc in documents]
+
+    # Score all pairs
+    logger.debug("Reranking %d documents with query: %s", len(documents), query[:100])
+    start = perf_counter()
+
+    scores = reranker.predict(pairs)
+
+    elapsed = perf_counter() - start
+    logger.debug("Reranking completed in %.2fs (%.0f docs/sec)",
+                 elapsed, len(documents) / elapsed if elapsed > 0 else 0)
+
+    # Create index-score pairs and sort by score descending
+    results = [
+        {"index": idx, "relevance_score": float(score)}
+        for idx, score in enumerate(scores)
+    ]
+    results.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+    # Apply top_n if specified
+    if top_n is not None and top_n > 0:
+        results = results[:top_n]
+
+    logger.debug("Rerank scores - min: %.4f, max: %.4f, mean: %.4f",
+                 min(r["relevance_score"] for r in results) if results else 0,
+                 max(r["relevance_score"] for r in results) if results else 0,
+                 sum(r["relevance_score"] for r in results) / len(results) if results else 0)
+
+    return results

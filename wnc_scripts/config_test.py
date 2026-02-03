@@ -71,12 +71,15 @@ class OllamaSettings:
 
     # Models (must be pulled via `ollama pull` first)
     chat_model: str = "qwen3:8b"
+    #chat_model: str = "qwen2.5:7b"
     embed_model: str = "bge-m3:567m"
+    #embed_model: str = "nomic-embed-text:v1.5"
     # embed_dim: MUST match the model's actual output dimension (see OpenAISettings for detailed explanation)
     # bge-m3 native output: 1024 dimensions (fixed)
+    # nomic-embed-text:v1.5 output: 768 dimensions (fixed)
     # Note: Ollama API supports dimension reduction via 'dimensions' parameter,
     # but LightRAG does NOT currently pass this parameter to Ollama embeddings
-    embed_dim: int = 1024  # Correct dimension for bge-m3:567m (native output)
+    embed_dim: int = 1024
 
     # Think mode for models that support it (qwen3, gpt-oss, deepseek-v3, deepseek-r1)
     # False = disable chain-of-thought reasoning (much faster)
@@ -88,13 +91,13 @@ class OllamaSettings:
 @dataclass
 class OpenAITestConfig:
     #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb"
-    #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/3gpp"
-    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260126"
-    #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_3gpp"
+    #kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_json_260126"
+    kdb_dir: str = "/srv/ai/LightRAG/wnc_kdb/test_3gpp"
 
-    working_dir: str = "/srv/ai/LightRAG/rag_storage/test_json_260126"
+    #working_dir: str = "/srv/ai/LightRAG/rag_storage/test_json_260126"
     #working_dir: str = "/srv/ai/LightRAG/rag_storage/wnc_kdb"
-    #working_dir: str = "/srv/ai/LightRAG/rag_storage/test_3gpp"
+    working_dir: str = "/srv/ai/LightRAG/rag_storage/test_3gpp_openai"
+    #working_dir: str = "/srv/ai/LightRAG/rag_storage/test_3gpp_ollama"
 
     # Query mode - controls retrieval strategy
     # Options: naive, local, global, hybrid, mix, bypass
@@ -107,8 +110,8 @@ class OpenAITestConfig:
     mode: Literal["naive", "local", "global", "hybrid", "mix", "bypass"] = "hybrid"
     skip_index: bool = False
 
-    question: str = "What is client's IP address?"
-    #question: str = "What is Session Management procedures?"
+    #question: str = "What is client's IP address?"
+    question: str = "When a UE receives a `Manage UE Policy Command` message from the network, what is the expected response from the UE to confirm it has applied the new rules?"
 
     # Query parameters
     # chunk_top_k: Maximum number of text chunks sent to LLM for answer generation
@@ -120,6 +123,26 @@ class OpenAITestConfig:
     # Lower values = looser filtering (more entities), higher recall but more noise
     cosine_threshold: float = 0.3
 
+    # Reranking configuration (in-process reranker using sentence-transformers)
+    # enable_rerank: Enable reranking of retrieved chunks before sending to LLM
+    # - True: Apply reranking to improve relevance of top chunks (recommended)
+    # - False: Use original vector similarity scores only
+    enable_rerank: bool = False
+    # rerank_model_path: Path to local CrossEncoder model or HuggingFace model name
+    # Recommended models:
+    #   - ms-marco-MiniLM-L6-v2: Fast, good quality (50MB)
+    #   - ms-marco-MiniLM-L12-v2: Better quality, slower (130MB)
+    #   - bge-reranker-base: High quality, multilingual (280MB)
+    rerank_model_path: str = "/srv/ai/models/ms-marco-MiniLM-L6-v2"
+    # rerank_top_n: Maximum number of chunks to keep after reranking
+    # - None: Use chunk_top_k value (recommended)
+    # - int: Override with specific value
+    rerank_top_n: int | None = None
+    # min_rerank_score: Minimum rerank score threshold (filters low-relevance chunks)
+    # - 0.0: Keep all reranked chunks (default)
+    # - Higher values: More aggressive filtering
+    min_rerank_score: float = 0.0
+
     # Text chunk boost configuration (affects only chunks sent to LLM, not entities/edges)
     # enable_source_path_boost: If True, prioritizes chunks from specific source paths
     # source_path_boosts: List of {"prefix": "/path/", "boost": 0.05} rules
@@ -130,15 +153,27 @@ class OpenAITestConfig:
         {"prefix": "/srv/ai/LightRAG/wnc_kdb/test_json_260126/", "boost": 0.1}
     ])
 
-    # Number of documents processed concurrently during `rag.insert(...)`.
+    # Document-level concurrency: how many documents to index in parallel
+    # Independent from llm_model_max_async (which controls chunk-level concurrency)
     # Set to 1 for easier-to-read logs (no interleaving).
     max_parallel_insert: int = 1
+
+    # LLM concurrency control
+    # Controls maximum number of concurrent LLM calls (entity extraction, graph merging)
+    # - Entity extraction: uses llm_model_max_async directly (chunk_max_async = llm_model_max_async)
+    # - Graph merging: uses 2x multiplier (graph_max_async = llm_model_max_async * 2)
+    # Recommended values:
+    #   - 1: Sequential processing, no concurrency (safest for slow/limited hardware)
+    #   - 2-4: Moderate concurrency (good for local Ollama with decent hardware)
+    #   - 8+: High concurrency (only for powerful hardware or remote APIs like OpenAI)
+    # Default: 1 for Ollama (conservative), can increase for OpenAI
+    llm_model_max_async: int = 1
 
     # Re-indexing strategy
     # - "skip": Skip indexing entirely (same as skip_index=True)
     # - "incremental": Only index new files not already in storage (default)
     # - "force": Force re-index all files, clearing existing storage first
-    reindex_strategy: Literal["skip", "incremental", "force"] = "force"
+    reindex_strategy: Literal["skip", "incremental", "force"] = "incremental"
 
     # Logging configuration
     # LightRAG log level: DEBUG, INFO, WARNING, ERROR

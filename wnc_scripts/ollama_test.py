@@ -14,11 +14,11 @@ What this script does
 
 Configuration
 -------------
-Most settings are loaded from `wnc_scripts/test_config.py` (or `--config <path>`).
+Most settings are loaded from `wnc_scripts/config_test.py` (or `--config <path>`).
 
 Key flags
 ---------
-- `skip_index` can be set in `wnc_scripts/test_config.py` to run new questions
+- `skip_index` can be set in `wnc_scripts/config_test.py` to run new questions
   WITHOUT re-indexing (fast). This assumes `working_dir` already contains previously indexed data.
 
 Storage output (default backends)
@@ -77,9 +77,10 @@ from utils_test import (
     index_documents,
     run_query,
     enforce_text_only_mode,
+    rerank_model_func,
 )
 
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("test_config.py")
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config_test.py")
 
 
 def main() -> None:
@@ -87,7 +88,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
-        help="Path to config file (default: wnc_scripts/test_config.py).",
+        help="Path to config file (default: wnc_scripts/config_test.py).",
     )
     parser.add_argument("--kdb-dir", default=None, help="Override kdb_dir from config.")
     parser.add_argument(
@@ -147,16 +148,14 @@ def main() -> None:
     enforce_text_only_mode(config)
 
     kdb_dir = Path(args.kdb_dir) if args.kdb_dir else Path(config.kdb_dir)
-    # Override default working_dir to use ollama-specific directory if not explicitly set
+    # Determine working_dir: CLI arg > config > default
     if args.working_dir:
         working_dir = str(args.working_dir)
+    elif hasattr(config, 'working_dir') and config.working_dir:
+        working_dir = str(config.working_dir)
     else:
-        # Use ollama-specific working dir by default
-        base_dir = str(config.working_dir)
-        if "openai" in base_dir.lower():
-            working_dir = base_dir.replace("openai", "ollama")
-        else:
-            working_dir = str(Path(config.working_dir).parent / "rag_storage_ollama")
+        # No working_dir configured, use default
+        working_dir = "./rag_storage_ollama"
 
     mode = str(args.mode) if args.mode else str(config.mode)
     question = args.question if args.question is not None else str(config.question)
@@ -332,6 +331,24 @@ def main() -> None:
         if api_key:
             embedding_kwargs["api_key"] = api_key
 
+    # [WNC] Configure reranker if enabled
+    rerank_func = None
+    min_rerank_score = 0.0
+    if getattr(config, "enable_rerank", False):
+        rerank_model_path = getattr(config, "rerank_model_path", None)
+        if rerank_model_path:
+            # Store model_path in function attribute for access in rerank_model_func
+            rerank_model_func._model_path = rerank_model_path
+            rerank_func = rerank_model_func
+            min_rerank_score = getattr(config, "min_rerank_score", 0.0)
+            logger.info("Reranking enabled with model: %s", rerank_model_path)
+            logger.info("Rerank top_n: %s (None = use chunk_top_k)", getattr(config, "rerank_top_n", None))
+            logger.info("Min rerank score: %.4f", min_rerank_score)
+        else:
+            logger.warning("enable_rerank=True but rerank_model_path not configured, reranking disabled")
+    else:
+        logger.info("Reranking disabled (enable_rerank=False)")
+
     rag = LightRAG(
         working_dir=working_dir,
         llm_model_func=ollama_model_complete,  # Pass function directly, not a wrapper
@@ -350,6 +367,7 @@ def main() -> None:
                 **embedding_kwargs,
             ),
         ),
+        llm_model_max_async=config.llm_model_max_async,
         max_parallel_insert=int(getattr(config, "max_parallel_insert", 2)),
         enable_llm_cache=config.enable_llm_cache,
         enable_llm_cache_for_entity_extract=config.enable_llm_cache_for_entity_extract,
@@ -359,7 +377,18 @@ def main() -> None:
         # [WNC] Source path boost configuration
         enable_source_path_boost=enable_source_path_boost,
         source_path_boosts=source_path_boosts,
+        # [WNC] Reranking configuration
+        rerank_model_func=rerank_func,
+        min_rerank_score=min_rerank_score,
     )
+
+    # Log effective concurrency settings for transparency
+    logger.info("=" * 60)
+    logger.info("Concurrency Configuration:")
+    logger.info("  llm_model_max_async: %s (chunk-level entity extraction)", rag.llm_model_max_async)
+    logger.info("  graph_max_async: %s (graph merging, 2x multiplier)", rag.llm_model_max_async * 2)
+    logger.info("  max_parallel_insert: %s (document-level indexing)", rag.max_parallel_insert)
+    logger.info("=" * 60)
 
     # LightRAG requires explicit storage lifecycle management.
     # We initialize storages before indexing/querying and finalize at the end.
@@ -375,7 +404,17 @@ def main() -> None:
             )
 
         # Run query using shared helper (text-only, no multimodal)
-        answer = run_query(rag, question, mode=mode, chunk_top_k=chunk_top_k)
+        # Pass rerank configuration to query
+        enable_rerank = getattr(config, "enable_rerank", None)
+        rerank_top_n = getattr(config, "rerank_top_n", None)
+        answer = run_query(
+            rag,
+            question,
+            mode=mode,
+            chunk_top_k=chunk_top_k,
+            enable_rerank=enable_rerank,
+            rerank_top_n=rerank_top_n,
+        )
 
         logger.info("Question:\n%s", question.strip())
         logger.info("Answer:\n%s", answer)

@@ -3183,6 +3183,15 @@ async def apply_rerank_if_enabled(
              "Returns original docs on early exit (disabled, no func, exception).",
         level="info",
     )
+
+    # [WNC] Capture "before" positions for rerank delta calculation
+    # Build mapping from chunk_id to original position (1-based)
+    before_by_chunk_id = {
+        doc["chunk_id"]: i + 1
+        for i, doc in enumerate(retrieved_docs)
+        if doc.get("chunk_id")
+    }
+
     if not enable_rerank or not retrieved_docs:
         wnc_log(
             purpose="[OUTPUT] apply_rerank_if_enabled early return - disabled or no docs",
@@ -3238,14 +3247,24 @@ async def apply_rerank_if_enabled(
             if isinstance(rerank_results[0], dict) and "index" in rerank_results[0]:
                 # New format: [{"index": 0, "relevance_score": 0.85}, ...]
                 reranked_docs = []
-                for result in rerank_results:
+                # [WNC] Enumerate with 1-based position for "after rerank" tracking
+                for after_rank, result in enumerate(rerank_results, start=1):
                     index = result["index"]
                     relevance_score = result["relevance_score"]
 
                     # Get original document and add rerank score
                     if 0 <= index < len(retrieved_docs):
                         doc = retrieved_docs[index].copy()
+
+                        # [WNC] Add rerank position tracking fields
+                        position_before_rerank = index + 1  # Convert 0-based index to 1-based position
+                        position_after_rerank = after_rank
+                        rerank_delta = position_before_rerank - position_after_rerank  # Positive = moved up
+
                         doc["rerank_score"] = relevance_score
+                        doc["position_before_rerank"] = position_before_rerank
+                        doc["position_after_rerank"] = position_after_rerank
+                        doc["rerank_delta"] = rerank_delta
                         reranked_docs.append(doc)
 
                 logger.info(
@@ -3264,15 +3283,31 @@ async def apply_rerank_if_enabled(
                 # Legacy format: assume it's already reranked documents
                 logger.info(f"Using legacy rerank format: {len(rerank_results)} chunks")
                 final_results = rerank_results[:top_n] if top_n else rerank_results
+
+                # [WNC] Add position tracking for legacy format
+                annotated_results = []
+                for after_rank, doc in enumerate(final_results, start=1):
+                    doc_copy = doc.copy()
+                    chunk_id = doc_copy.get("chunk_id")
+                    position_before_rerank = before_by_chunk_id.get(chunk_id) if chunk_id else None
+
+                    # [WNC] Set position tracking fields
+                    doc_copy["position_before_rerank"] = position_before_rerank
+                    doc_copy["position_after_rerank"] = after_rank
+                    doc_copy["rerank_delta"] = (
+                        (position_before_rerank - after_rank) if position_before_rerank else None
+                    )
+                    annotated_results.append(doc_copy)
+
                 wnc_log(
                     purpose="[OUTPUT] apply_rerank_if_enabled success - legacy format",
                     outputs={
-                        "reranked_docs": final_results,
-                        "note": f"Using legacy rerank format: {len(final_results)} chunks",
+                        "reranked_docs": annotated_results,
+                        "note": f"Using legacy rerank format: {len(annotated_results)} chunks with position tracking",
                     },
                     level="info",
                 )
-                return final_results
+                return annotated_results
         else:
             logger.warning("Rerank returned empty results, using original chunks")
             wnc_log(

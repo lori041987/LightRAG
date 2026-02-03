@@ -1,6 +1,8 @@
 from ..utils import verbose_debug, VERBOSE_DEBUG
 import os
 import logging
+import time
+from datetime import datetime
 
 from collections.abc import AsyncIterator
 
@@ -98,6 +100,82 @@ def _get_tiktoken_encoding_for_model(model: str) -> Any:
             )
             _TIKTOKEN_ENCODING_CACHE[model] = tiktoken.get_encoding("cl100k_base")
     return _TIKTOKEN_ENCODING_CACHE[model]
+
+
+def _format_openai_performance(response: object, start_time: float) -> str:
+    """
+    [WNC] Format OpenAI response performance metrics including timing and throughput.
+
+    For LLM responses: Uses 'created' timestamp if available, otherwise uses start_time.
+    For embedding responses: Uses start_time (no 'created' field in embedding responses).
+
+    Args:
+        response: Response object from OpenAI SDK (chat completion or embedding)
+        start_time: Request start time from time.time()
+
+    Returns:
+        Formatted string with performance metrics: created/start time, elapsed time, tokens, throughput
+    """
+    # [WNC] Check if this is an embedding response (no 'created' field)
+    is_embedding = hasattr(response, "object") and response.object == "list"
+
+    if is_embedding:
+        # [WNC] Embedding response - use start_time and usage
+        if not hasattr(response, "usage") or not response.usage:
+            return "Performance: tokens: N/A"
+
+        prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
+        total_tokens = getattr(response.usage, "total_tokens", 0)
+
+        # [WNC] Calculate elapsed time from start
+        elapsed = time.time() - start_time
+
+        # [WNC] Calculate throughput (tokens/second)
+        tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+
+        start_dt = datetime.fromtimestamp(start_time)
+        start_str = start_dt.strftime("%H:%M:%S")
+
+        return (
+            f"Performance: start={start_str}, elapsed={elapsed:.2f}s | "
+            f"tokens: prompt={prompt_tokens}, total={total_tokens} | "
+            f"throughput={tokens_per_sec:.1f} tokens/s"
+        )
+    else:
+        # [WNC] LLM completion response
+        if not hasattr(response, "usage") or not response.usage:
+            return "Performance: tokens: N/A"
+
+        prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
+        completion_tokens = getattr(response.usage, "completion_tokens", 0)
+        total_tokens = getattr(response.usage, "total_tokens", 0)
+
+        # [WNC] Try to use 'created' timestamp first, fall back to start_time
+        created_ts = getattr(response, "created", None)
+
+        if created_ts:
+            # [WNC] Use created timestamp from response
+            created_dt = datetime.fromtimestamp(created_ts)
+            time_str = created_dt.strftime("%H:%M:%S")
+            time_label = "created"
+            # [WNC] Calculate elapsed from created to now
+            elapsed = time.time() - created_ts
+        else:
+            # [WNC] Fall back to start_time if no created field
+            start_dt = datetime.fromtimestamp(start_time)
+            time_str = start_dt.strftime("%H:%M:%S")
+            time_label = "start"
+            # [WNC] Calculate elapsed from start to now
+            elapsed = time.time() - start_time
+
+        # [WNC] Calculate throughput (tokens/second)
+        tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+
+        return (
+            f"Performance: {time_label}={time_str}, elapsed={elapsed:.2f}s | "
+            f"tokens: prompt={prompt_tokens}, output={completion_tokens}, total={total_tokens} | "
+            f"throughput={tokens_per_sec:.1f} tokens/s"
+        )
 
 
 def create_openai_async_client(
@@ -346,6 +424,9 @@ async def openai_complete_if_cache(
     # Determine the correct model identifier to use
     # For Azure OpenAI, we must use the deployment name instead of the model name
     api_model = azure_deployment if use_azure and azure_deployment else model
+
+    # [WNC] Record start time for performance calculation
+    request_start_time = time.time()
 
     try:
         # Don't use async with context manager, use client directly
@@ -641,6 +722,8 @@ async def openai_complete_if_cache(
                 token_tracker.add_usage(token_counts)
 
             logger.debug(f"Response content len: {len(final_content)}")
+            # [WNC] Add performance logging to match Ollama implementation
+            logger.debug(f"{_format_openai_performance(response, request_start_time)}")
             verbose_debug(f"Response: {response}")
 
             wnc_log(
@@ -896,6 +979,9 @@ async def openai_embed(
         if embedding_dim is not None:
             api_params["dimensions"] = embedding_dim
 
+        # [WNC] Record start time for performance calculation
+        request_start_time = time.time()
+
         # Make API call
         response = await openai_async_client.embeddings.create(**api_params)
 
@@ -910,8 +996,8 @@ async def openai_embed(
         )
         logger.debug(f"Received embeddings for {len(response.data)} texts")
         logger.debug(f"Embeddings shape: {embeddings_result.shape}")
-        if hasattr(response, "usage"):
-            logger.debug(f"Prompt tokens: {getattr(response.usage, 'prompt_tokens', 0)}, Total tokens: {getattr(response.usage, 'total_tokens', 0)}")
+        # [WNC] Add performance logging to match Ollama implementation
+        logger.debug(f"{_format_openai_performance(response, request_start_time)}")
         verbose_debug(f"Response: {response}")
 
         if token_tracker and hasattr(response, "usage"):

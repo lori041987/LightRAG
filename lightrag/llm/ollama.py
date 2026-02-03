@@ -47,7 +47,7 @@ def _format_ollama_durations(response: dict) -> str:
         response: Response dict from Ollama SDK containing duration fields (in nanoseconds)
 
     Returns:
-        Formatted string with durations in seconds
+        Formatted string with durations in seconds, including wnc_sum and wnc_gap metrics
     """
     def ns_to_s(ns):
         """Convert nanoseconds to seconds"""
@@ -59,6 +59,15 @@ def _format_ollama_durations(response: dict) -> str:
     eval_dur = response.get("eval_duration")
     prompt_count = response.get("prompt_eval_count", "N/A")
     eval_count = response.get("eval_count", "N/A")
+
+    # [WNC] Calculate wnc_sum: sum of all breakdown durations
+    # This is the "accountable" time that can be explained by individual metrics
+    wnc_sum_ns = (load or 0) + (prompt_eval or 0) + (eval_dur or 0)
+
+    # [WNC] Calculate wnc_gap: total - wnc_sum
+    # This reveals "missing" time not accounted for in the breakdown
+    # Large gaps may indicate overhead, network delays, or Ollama internal processing
+    wnc_gap_ns = (total or 0) - wnc_sum_ns if total else None
 
     parts = []
     if total:
@@ -77,7 +86,18 @@ def _format_ollama_durations(response: dict) -> str:
     timing = " ".join(parts) if parts else "N/A"
     tokens = f"tokens: prompt={prompt_count}, output={eval_count}"
 
-    return f"{timing} | {tokens}"
+    # [WNC] Add wnc_sum and wnc_gap to output
+    wnc_metrics = []
+    if wnc_sum_ns > 0:
+        wnc_metrics.append(f"wnc_sum={ns_to_s(wnc_sum_ns)}")
+    if wnc_gap_ns is not None:
+        wnc_metrics.append(f"wnc_gap={ns_to_s(wnc_gap_ns)}")
+
+    result = f"{timing} | {tokens}"
+    if wnc_metrics:
+        result += f" | {' | '.join(wnc_metrics)}"
+
+    return result
 
 
 def _coerce_host_for_cloud_model(host: Optional[str], model: object) -> Optional[str]:
@@ -312,6 +332,7 @@ async def ollama_embed(
         # [WNC] Add debug logging after receiving response to match LLM implementation
         logger.debug(f"Received embeddings for {len(data['embeddings'])} texts")
         logger.debug(f"Embeddings shape: {np.array(data['embeddings']).shape}")
+        logger.debug(f"Performance: {_format_ollama_durations(data)}")
         verbose_debug(f"Response: {data}")
 
         # [WNC] Output log
